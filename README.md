@@ -184,7 +184,7 @@ Most users can start with defaults. Set an agent-level config only when you need
   "defaults": {
     "provider": "chatgpt",
     "preset": "<preset id from ORACLE_SUBMIT_PRESETS>",
-    "grokMode": "heavy"
+    "grokMode": "expert"
   },
   "auth": {
     "chromeProfile": "Default"
@@ -196,7 +196,7 @@ Notes:
 
 - `defaults.provider` is the default web provider: `chatgpt` or `grok`.
 - `defaults.preset` is the default ChatGPT model preset for oracle jobs.
-- `defaults.grokMode` is the default Grok mode. Only `heavy` is supported today.
+- `defaults.grokMode` is the default Grok mode: `expert` (free) or `heavy` (requires SuperGrok Heavy subscription).
 - The canonical preset ids and provider modes live in [`extensions/oracle/lib/config.ts`](extensions/oracle/lib/config.ts).
 - If the packaged default is fine, omit `defaults`.
 - When an agent is unsure which oracle preset fits, it should omit `preset` and use the configured default model instead of asking by default. If the prompt says to use Grok, it should pass `provider: "grok"` to `oracle_submit`.
@@ -240,7 +240,7 @@ Example Helium config:
 | Provider | Mode / preset | Upload ceiling |
 | --- | --- | --- |
 | ChatGPT | Presets below | 250 MiB |
-| Grok | `heavy` only | 200 MiB |
+| Grok | `expert` (free), `heavy` (paid) | 200 MiB |
 
 Grok accepts the same `.tar.zst` archives that pi-oracle builds. Manual testing against `https://grok.com` found a 200 MiB file is accepted and a 200 MiB + 1 byte file is rejected, so pi-oracle caps Grok archives at 200 MiB.
 
@@ -257,7 +257,7 @@ Grok accepts the same `.tar.zst` archives that pi-oracle builds. Manual testing 
 | `instant` | Instant |
 | `instant_auto_switch` | Instant - Auto-switch to Thinking Enabled |
 
-For ChatGPT, `oracle_submit` accepts canonical preset ids or a matching human-readable preset label. Keep config values on canonical ids. For Grok, use `provider: "grok"`; only Heavy is supported today.
+For ChatGPT, `oracle_submit` accepts canonical preset ids or a matching human-readable preset label. Keep config values on canonical ids. For Grok, use `provider: "grok"`; supported modes are `expert` (free, default) and `heavy` (requires SuperGrok Heavy subscription).
 
 ## Outputs and cleanup
 

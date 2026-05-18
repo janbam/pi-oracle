@@ -15,12 +15,14 @@ import { getLatestOracleJobLifecycleEvent, getLatestOracleTerminalLifecycleEvent
 import { isLockTimeoutError, withGlobalReconcileLock, withLock } from "./locks.js";
 import {
   coerceOracleSubmitPresetId,
+  GROK_MODES,
   loadOracleConfig,
   ORACLE_PROVIDERS,
   ORACLE_SUBMIT_PRESET_IDS,
   resolveOracleConfigForProvider,
   resolveOracleGrokMode,
   resolveOracleSubmitPreset,
+  type OracleGrokMode,
   type OracleProvider,
 } from "./config.js";
 import {
@@ -86,7 +88,7 @@ const ORACLE_SUBMIT_PARAMS = Type.Object({
   ),
   mode: Type.Optional(
     Type.String({
-      description: "Provider mode. For Grok, only heavy is currently supported. Omit to use the configured default mode.",
+      description: "Provider mode. For Grok, 'expert' (free, default) or 'heavy' (paid). Omit to use the configured default mode.",
     }),
   ),
   followUpJobId: Type.Optional(Type.String({ description: "Earlier oracle job id whose chat thread should be continued." })),
@@ -566,12 +568,15 @@ function normalizeOracleProvider(value: unknown, fallback: OracleProvider, toolN
   throw new Error(`Unknown ${toolName} provider: ${value}. Use chatgpt or grok.`);
 }
 
-function normalizeGrokMode(value: unknown, fallback: "heavy"): "heavy" {
+function normalizeGrokMode(value: unknown, fallback: OracleGrokMode): OracleGrokMode {
   if (value === undefined) return fallback;
   if (typeof value !== "string") throw new Error("oracle_submit mode must be a string");
   const normalized = value.trim().toLowerCase();
   if (normalized === "heavy" || normalized === "grok heavy" || normalized === "grok-heavy") return "heavy";
-  throw new Error(`Unknown Grok oracle mode: ${value}. Only heavy is currently supported.`);
+  if (normalized === "expert" || normalized === "grok expert" || normalized === "grok-expert") return "expert";
+  if (normalized === "fast" || normalized === "grok fast" || normalized === "grok-fast") return "fast";
+  if (normalized === "auto" || normalized === "grok auto" || normalized === "grok-auto") return "auto";
+  throw new Error(`Unknown Grok oracle mode: ${value}. Use one of: ${GROK_MODES.join(", ")}.`);
 }
 
 function getProviderMaxArchiveBytes(provider: "chatgpt" | "grok"): number {
@@ -1195,7 +1200,7 @@ export function registerOracleTools(pi: ExtensionAPI, workerPath: string, authWo
           throw new Error(`Follow-up job ${params.followUpJobId} uses provider ${followUp.provider}; cannot continue it with ${provider}.`);
         }
         if (provider === "grok" && typeof params.preset === "string") {
-          throw new Error("oracle_submit preset is only valid for ChatGPT. For Grok, use provider='grok' and mode='heavy'.");
+          throw new Error("oracle_submit preset is only valid for ChatGPT. For Grok, use provider='grok' and mode='expert' (or 'heavy' with SuperGrok subscription).");
         }
         const selection = provider === "grok"
           ? resolveOracleGrokMode(normalizeGrokMode(params.mode, baseConfig.defaults.grokMode))

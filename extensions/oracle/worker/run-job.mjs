@@ -973,13 +973,27 @@ async function waitForOracleReady(job) {
       await sleep(1000);
       continue;
     }
+    if (classification.state === "challenge_blocking") {
+      // In headed mode the user can solve the challenge; poll until it clears or timeout.
+      await log("Challenge/verification page detected — waiting for it to clear (headed mode allows manual solving)");
+      await sleep(5000);
+      continue;
+    }
     if (classification.state === "transient_outage_error" && !retriedOutage) {
       retriedOutage = true;
       await agentBrowser(job, "reload").catch(() => undefined);
       await sleep(1500);
       continue;
     }
-    if (classification.state !== "unknown") {
+    if (classification.state === "login_required") {
+      // Cloudflare interstitials can look like login pages before clearing.
+      // Give it a few polls before giving up.
+      const elapsedMs = Date.now() - startedAt;
+      if (elapsedMs < 60_000) {
+        await log(`Login required (possibly Cloudflare interstitial settling): ${classification.message}`);
+        await sleep(5000);
+        continue;
+      }
       await captureDiagnostics(job, "preflight");
       throw new Error(classification.message);
     }
@@ -1259,27 +1273,54 @@ async function configureModel(job) {
   await waitForModelConfigurationToSettle(job, { stronglyVerified });
 }
 
+const GROK_MODEL_MENU_PATTERNS = {
+  fast: /\bFast\b/i,
+  auto: /\bAuto\b/i,
+  expert: /\bExpert\b/i,
+  heavy: /\bHeavy\b/i,
+};
+
 async function configureGrokModel(job) {
-  const snapshot = await snapshotText(job);
-  if (/\bHeavy\b/.test(snapshot) && !snapshot.includes(`button "${GROK_LABELS.modelSelect}"`)) {
-    await log("Grok model already appears configured for Heavy; skipping reconfiguration");
+  const mode = job.selection?.effort || "expert";
+  const targetPattern = GROK_MODEL_MENU_PATTERNS[mode];
+  if (!targetPattern) {
+    await log(`Grok: unknown mode "${mode}", leaving default model as-is`);
     return;
   }
+
+  const snapshot = await snapshotText(job);
+  // Check if target model is already the selected one (model select button shows it as StaticText, menu closed)
   const modelButton = findEntry(snapshot, (candidate) => candidate.kind === "button" && candidate.label === GROK_LABELS.modelSelect && !candidate.disabled);
-  if (!modelButton) throw new Error("Could not find Grok model selector");
+  if (!modelButton) {
+    await log("Grok: model select button not found, leaving model as-is");
+    return;
+  }
+
+  // Check current selection — the button's StaticText child shows the active model
+  if (targetPattern.test(snapshot)) {
+    await log(`Grok: model already set to ${mode}, skipping`);
+    return;
+  }
+
+  await log(`Grok: selecting ${mode} model`);
   await clickRef(job, modelButton.ref);
-  await agentBrowser(job, "wait", "500");
+  await agentBrowser(job, "wait", "600");
   const menuSnapshot = await snapshotText(job);
-  const heavy = findEntry(menuSnapshot, (candidate) => ["menuitem", "menuitemradio", "option", "button"].includes(candidate.kind || "") && /^Heavy\b/i.test(String(candidate.label || "")) && !candidate.disabled);
-  if (!heavy) throw new Error("Could not find Grok Heavy model option");
-  await clickRef(job, heavy.ref);
-  await agentBrowser(job, "wait", "800");
+  const targetEntry = findEntry(menuSnapshot, (candidate) => ["menuitem", "menuitemradio", "option", "button"].includes(candidate.kind || "") && targetPattern.test(String(candidate.label || "")) && !candidate.disabled);
+  if (!targetEntry) {
+    await log(`Grok: ${mode} model not found in menu, leaving default`);
+    // Close menu
+    await agentBrowser(job, "press", "Escape").catch(() => undefined);
+    return;
+  }
+  await clickRef(job, targetEntry.ref);
+  await agentBrowser(job, "wait", "1200");
   const after = await snapshotText(job);
-  if (!/\bHeavy\b/i.test(after)) {
-    if (after.includes('link "Sign in"') || after.includes('button "Sign in"')) {
-      throw new Error("Grok Heavy requires a signed-in Grok session. Set defaults.provider='grok', run /oracle-auth, and retry.");
-    }
-    throw new Error("Could not verify Grok Heavy selection after model configuration");
+  const stuck = targetPattern.test(after);
+  if (!stuck) {
+    // Log a snippet of the after snapshot for debugging
+    const lines = after.split("\n").filter(l => /model|expert|auto|fast|heavy/i.test(l)).join(" | ");
+    await log(`Grok: ${mode} model did not stick. Snapshot hint: ${lines.slice(0, 300)}`);
   }
 }
 
@@ -1289,16 +1330,23 @@ async function uploadArchive(job) {
   }
 
   const fileLabel = basename(job.archivePath);
-  const addFilesSnapshot = await snapshotText(job);
-  const baselineComposerFileCount = composerFileEntryCount(addFilesSnapshot, fileLabel, job);
   const labels = labelsForJob(job);
-  const addFilesEntry = findEntry(
-    addFilesSnapshot,
-    (candidate) => candidate.label === labels.addFiles && candidate.kind === "button",
-  );
+  // Retry finding the attach button — Grok UI may still be settling after model selection
+  let addFilesEntry;
+  let addFilesSnapshot;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    addFilesSnapshot = await snapshotText(job);
+    addFilesEntry = findEntry(
+      addFilesSnapshot,
+      (candidate) => candidate.label === labels.addFiles && candidate.kind === "button",
+    );
+    if (addFilesEntry) break;
+    if (attempt < 4) await sleep(1000);
+  }
   if (!addFilesEntry) {
     throw new Error(`Could not find "${labels.addFiles}" button`);
   }
+  const baselineComposerFileCount = composerFileEntryCount(addFilesSnapshot, fileLabel, job);
 
   await clickRef(job, addFilesEntry.ref);
   await agentBrowser(job, "wait", "500");

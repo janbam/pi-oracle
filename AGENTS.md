@@ -29,3 +29,15 @@ This file contains project-specific guidance for this repository.
 - Do not put changelog/history in `AGENTS.md`; use `progress.md` for transient handoff state and delete it once the work is committed or no longer useful.
 - Ignore temporary artifacts locally or delete them once they have been consumed.
 - Do not leave temporary working files around as untracked repo noise after they are no longer useful.
+
+## Grok UI debugging
+
+Grok's web UI is volatile — model menu items, labels, and popups change frequently.
+When Grok model selection or upload flow breaks, read the dev-browser skill (`~/src/dev-browser/skills/dev-browser/SKILL.md`) and use it for low-level debugging:
+
+1. Start the dev-browser server: `cd ~/src/dev-browser/skills/dev-browser && bash server.sh`
+2. Use `npx tsx` scripts with `@/client.js` to navigate, snapshot, and click elements
+3. The Playwright-based browser gives full DOM access and stable selectors
+4. Use `page.accessibility.snapshot({ interestingOnly: true })` to get the ARIA snapshot matching what `parseSnapshotEntries` processes
+5. Compare snapshot output against selectors in `run-job.mjs` (model select, Attach button, upload input)
+6. Once fixed, test via oracle_submit to confirm the automation works end-to-end

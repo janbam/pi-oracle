@@ -16,10 +16,10 @@ export type OracleProvider = (typeof ORACLE_PROVIDERS)[number];
 export const MODEL_FAMILIES = ["instant", "thinking", "pro", "grok"] as const;
 export type OracleModelFamily = (typeof MODEL_FAMILIES)[number];
 
-export const EFFORTS = ["light", "standard", "extended", "heavy"] as const;
+export const EFFORTS = ["light", "standard", "extended", "heavy", "expert", "fast", "auto"] as const;
 export type OracleEffort = (typeof EFFORTS)[number];
 
-export const GROK_MODES = ["heavy"] as const;
+export const GROK_MODES = ["heavy", "expert", "fast", "auto"] as const;
 export type OracleGrokMode = (typeof GROK_MODES)[number];
 
 /**
@@ -190,7 +190,7 @@ export function resolveOracleGrokMode(mode: OracleGrokMode): OracleResolvedSelec
     provider: "grok",
     mode,
     modelFamily: "grok",
-    effort: "heavy",
+    effort: mode,
     autoSwitchToThinking: false,
   };
 }
@@ -360,7 +360,7 @@ export const DEFAULT_CONFIG: OracleConfig = {
   defaults: {
     provider: "chatgpt",
     preset: "pro_extended",
-    grokMode: "heavy",
+    grokMode: "expert",
   },
   browser: {
     sessionPrefix: "oracle",
