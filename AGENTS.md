@@ -33,7 +33,7 @@ This file contains project-specific guidance for this repository.
 ## Grok UI debugging
 
 Grok's web UI is volatile — model menu items, labels, and popups change frequently.
-When Grok model selection or upload flow breaks, use the **dev-browser** skill for low-level debugging:
+When Grok model selection or upload flow breaks, read the dev-browser skill (`~/src/dev-browser/skills/dev-browser/SKILL.md`) and use it for low-level debugging:
 
 1. Start the dev-browser server: `cd ~/src/dev-browser/skills/dev-browser && bash server.sh`
 2. Use `npx tsx` scripts with `@/client.js` to navigate, snapshot, and click elements
