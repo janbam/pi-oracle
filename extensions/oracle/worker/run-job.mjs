@@ -1259,28 +1259,10 @@ async function configureModel(job) {
   await waitForModelConfigurationToSettle(job, { stronglyVerified });
 }
 
-async function configureGrokModel(job) {
-  const snapshot = await snapshotText(job);
-  if (/\bHeavy\b/.test(snapshot) && !snapshot.includes(`button "${GROK_LABELS.modelSelect}"`)) {
-    await log("Grok model already appears configured for Heavy; skipping reconfiguration");
-    return;
-  }
-  const modelButton = findEntry(snapshot, (candidate) => candidate.kind === "button" && candidate.label === GROK_LABELS.modelSelect && !candidate.disabled);
-  if (!modelButton) throw new Error("Could not find Grok model selector");
-  await clickRef(job, modelButton.ref);
-  await agentBrowser(job, "wait", "500");
-  const menuSnapshot = await snapshotText(job);
-  const heavy = findEntry(menuSnapshot, (candidate) => ["menuitem", "menuitemradio", "option", "button"].includes(candidate.kind || "") && /^Heavy\b/i.test(String(candidate.label || "")) && !candidate.disabled);
-  if (!heavy) throw new Error("Could not find Grok Heavy model option");
-  await clickRef(job, heavy.ref);
-  await agentBrowser(job, "wait", "800");
-  const after = await snapshotText(job);
-  if (!/\bHeavy\b/i.test(after)) {
-    if (after.includes('link "Sign in"') || after.includes('button "Sign in"')) {
-      throw new Error("Grok Heavy requires a signed-in Grok session. Set defaults.provider='grok', run /oracle-auth, and retry.");
-    }
-    throw new Error("Could not verify Grok Heavy selection after model configuration");
-  }
+async function configureGrokModel(_job) {
+  // Use Grok's default model (Auto) — the composer is ready out of the box.
+  // Model-specific selection (expert/heavy) can be added later when UI is stable.
+  await log("Grok: using default model (Auto), skipping model configuration");
 }
 
 async function uploadArchive(job) {
@@ -1289,16 +1271,23 @@ async function uploadArchive(job) {
   }
 
   const fileLabel = basename(job.archivePath);
-  const addFilesSnapshot = await snapshotText(job);
-  const baselineComposerFileCount = composerFileEntryCount(addFilesSnapshot, fileLabel, job);
   const labels = labelsForJob(job);
-  const addFilesEntry = findEntry(
-    addFilesSnapshot,
-    (candidate) => candidate.label === labels.addFiles && candidate.kind === "button",
-  );
+  // Retry finding the attach button — Grok UI may still be settling after model selection
+  let addFilesEntry;
+  let addFilesSnapshot;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    addFilesSnapshot = await snapshotText(job);
+    addFilesEntry = findEntry(
+      addFilesSnapshot,
+      (candidate) => candidate.label === labels.addFiles && candidate.kind === "button",
+    );
+    if (addFilesEntry) break;
+    if (attempt < 4) await sleep(1000);
+  }
   if (!addFilesEntry) {
     throw new Error(`Could not find "${labels.addFiles}" button`);
   }
+  const baselineComposerFileCount = composerFileEntryCount(addFilesSnapshot, fileLabel, job);
 
   await clickRef(job, addFilesEntry.ref);
   await agentBrowser(job, "wait", "500");
