@@ -16,10 +16,10 @@ export type OracleProvider = (typeof ORACLE_PROVIDERS)[number];
 export const MODEL_FAMILIES = ["instant", "thinking", "pro", "grok"] as const;
 export type OracleModelFamily = (typeof MODEL_FAMILIES)[number];
 
-export const EFFORTS = ["light", "standard", "extended", "heavy", "expert"] as const;
+export const EFFORTS = ["light", "standard", "extended", "heavy", "expert", "fast", "auto"] as const;
 export type OracleEffort = (typeof EFFORTS)[number];
 
-export const GROK_MODES = ["heavy", "expert"] as const;
+export const GROK_MODES = ["heavy", "expert", "fast", "auto"] as const;
 export type OracleGrokMode = (typeof GROK_MODES)[number];
 
 /**

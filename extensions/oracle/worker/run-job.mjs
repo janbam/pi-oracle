@@ -1273,10 +1273,55 @@ async function configureModel(job) {
   await waitForModelConfigurationToSettle(job, { stronglyVerified });
 }
 
-async function configureGrokModel(_job) {
-  // Use Grok's default model (Auto) — the composer is ready out of the box.
-  // Model-specific selection (expert/heavy) can be added later when UI is stable.
-  await log("Grok: using default model (Auto), skipping model configuration");
+const GROK_MODEL_MENU_PATTERNS = {
+  fast: /\bFast\b/i,
+  auto: /\bAuto\b/i,
+  expert: /\bExpert\b/i,
+  heavy: /\bHeavy\b/i,
+};
+
+async function configureGrokModel(job) {
+  const mode = job.selection?.effort || "expert";
+  const targetPattern = GROK_MODEL_MENU_PATTERNS[mode];
+  if (!targetPattern) {
+    await log(`Grok: unknown mode "${mode}", leaving default model as-is`);
+    return;
+  }
+
+  const snapshot = await snapshotText(job);
+  // Check if target model is already the selected one (model select button shows it as StaticText, menu closed)
+  const modelButton = findEntry(snapshot, (candidate) => candidate.kind === "button" && candidate.label === "Model select" && !candidate.disabled);
+  if (!modelButton) {
+    await log("Grok: model select button not found, leaving model as-is");
+    return;
+  }
+
+  // Check current selection — the button's StaticText child shows the active model
+  if (targetPattern.test(snapshot)) {
+    await log(`Grok: model already set to ${mode}, skipping`);
+    return;
+  }
+
+  await log(`Grok: selecting ${mode} model`);
+  await clickRef(job, modelButton.ref);
+  await agentBrowser(job, "wait", "600");
+  const menuSnapshot = await snapshotText(job);
+  const targetEntry = findEntry(menuSnapshot, (candidate) => ["menuitem", "menuitemradio", "option", "button"].includes(candidate.kind || "") && targetPattern.test(String(candidate.label || "")) && !candidate.disabled);
+  if (!targetEntry) {
+    await log(`Grok: ${mode} model not found in menu, leaving default`);
+    // Close menu
+    await agentBrowser(job, "press", "Escape").catch(() => undefined);
+    return;
+  }
+  await clickRef(job, targetEntry.ref);
+  await agentBrowser(job, "wait", "1200");
+  const after = await snapshotText(job);
+  const stuck = targetPattern.test(after);
+  if (!stuck) {
+    // Log a snippet of the after snapshot for debugging
+    const lines = after.split("\n").filter(l => /model|expert|auto|fast|heavy/i.test(l)).join(" | ");
+    await log(`Grok: ${mode} model did not stick. Snapshot hint: ${lines.slice(0, 300)}`);
+  }
 }
 
 async function uploadArchive(job) {

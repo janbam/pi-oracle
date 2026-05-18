@@ -574,6 +574,8 @@ function normalizeGrokMode(value: unknown, fallback: OracleGrokMode): OracleGrok
   const normalized = value.trim().toLowerCase();
   if (normalized === "heavy" || normalized === "grok heavy" || normalized === "grok-heavy") return "heavy";
   if (normalized === "expert" || normalized === "grok expert" || normalized === "grok-expert") return "expert";
+  if (normalized === "fast" || normalized === "grok fast" || normalized === "grok-fast") return "fast";
+  if (normalized === "auto" || normalized === "grok auto" || normalized === "grok-auto") return "auto";
   throw new Error(`Unknown Grok oracle mode: ${value}. Use one of: ${GROK_MODES.join(", ")}.`);
 }
 
