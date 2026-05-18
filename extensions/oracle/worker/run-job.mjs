@@ -973,13 +973,27 @@ async function waitForOracleReady(job) {
       await sleep(1000);
       continue;
     }
+    if (classification.state === "challenge_blocking") {
+      // In headed mode the user can solve the challenge; poll until it clears or timeout.
+      await log("Challenge/verification page detected — waiting for it to clear (headed mode allows manual solving)");
+      await sleep(5000);
+      continue;
+    }
     if (classification.state === "transient_outage_error" && !retriedOutage) {
       retriedOutage = true;
       await agentBrowser(job, "reload").catch(() => undefined);
       await sleep(1500);
       continue;
     }
-    if (classification.state !== "unknown") {
+    if (classification.state === "login_required") {
+      // Cloudflare interstitials can look like login pages before clearing.
+      // Give it a few polls before giving up.
+      const elapsedMs = Date.now() - startedAt;
+      if (elapsedMs < 60_000) {
+        await log(`Login required (possibly Cloudflare interstitial settling): ${classification.message}`);
+        await sleep(5000);
+        continue;
+      }
       await captureDiagnostics(job, "preflight");
       throw new Error(classification.message);
     }
