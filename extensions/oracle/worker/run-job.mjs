@@ -1290,7 +1290,7 @@ async function configureGrokModel(job) {
 
   const snapshot = await snapshotText(job);
   // Check if target model is already the selected one (model select button shows it as StaticText, menu closed)
-  const modelButton = findEntry(snapshot, (candidate) => candidate.kind === "button" && candidate.label === "Model select" && !candidate.disabled);
+  const modelButton = findEntry(snapshot, (candidate) => candidate.kind === "button" && candidate.label === GROK_LABELS.modelSelect && !candidate.disabled);
   if (!modelButton) {
     await log("Grok: model select button not found, leaving model as-is");
     return;
