@@ -6,7 +6,7 @@
 // Invariants/Assumptions: Tests run from the repository root with local development dependencies installed.
 import { createCipheriv, createHash, pbkdf2Sync, randomBytes, randomUUID } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { basename, join } from "node:path";
@@ -233,23 +233,6 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-const IN_FLIGHT_LOCK_PUBLISHER_SCRIPT = [
-  'import { createHash } from "node:crypto";',
-  'import { mkdir, rename, writeFile } from "node:fs/promises";',
-  'import { join } from "node:path";',
-  'const [stateDir, kind, key] = process.argv.slice(1);',
-  'const finalName = `${kind}-${createHash("sha256").update(key).digest("hex").slice(0, 24)}`;',
-  'const parentDir = join(stateDir, "locks");',
-  'const tempPath = join(parentDir, `.tmp-${finalName}.${process.pid}.${Date.now()}.child`);',
-  'const finalPath = join(parentDir, finalName);',
-  'await mkdir(parentDir, { recursive: true, mode: 0o700 });',
-  'await mkdir(tempPath, { recursive: false, mode: 0o700 });',
-  'process.stdin.resume();',
-  'await new Promise((resolve) => process.stdin.once("data", () => resolve(undefined)));',
-  'await writeFile(join(tempPath, "metadata.json"), `${JSON.stringify({ processPid: process.pid, source: "oracle-sanity-inflight-publisher" }, null, 2)}\\n`, { encoding: "utf8", mode: 0o600 });',
-  'await rename(tempPath, finalPath);',
-].join("\n");
-
 function readProcessStartedAt(pid: number | undefined): string | undefined {
   if (!pid || pid <= 0) return undefined;
   try {
@@ -286,17 +269,6 @@ async function pathExists(path: string): Promise<boolean> {
   } catch {
     return false;
   }
-}
-
-async function waitForTmpStateDir(parentDir: string, finalName: string, timeoutMs: number): Promise<string> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const entries = await readdir(parentDir).catch(() => [] as string[]);
-    const match = entries.find((name) => name.startsWith(`.tmp-${finalName}.`));
-    if (match) return join(parentDir, match);
-    await sleep(25);
-  }
-  throw new Error(`Timed out waiting for in-flight .tmp-* dir for ${finalName}`);
 }
 
 function hashedOracleStatePath(kind: string, key: string, rootDir: string): string {
@@ -3002,44 +2974,27 @@ async function testTmpLockDirGraceHonorsConfiguredWindow(): Promise<void> {
 
 async function testTmpLockDirGracePreventsInFlightPublishReclaim(): Promise<void> {
   await resetOracleStateDir();
-  const stateDir = getOracleStateDir();
   const kind = "job";
   const key = `tmp-lock-grace-${randomUUID()}`;
   const finalPath = hashedOracleStatePath(kind, key, getLocksDir());
   const finalName = basename(finalPath);
-  const child = spawn(process.execPath, ["--input-type=module", "--eval", IN_FLIGHT_LOCK_PUBLISHER_SCRIPT, stateDir, kind, key], {
-    stdio: ["pipe", "ignore", "pipe"],
-  });
-  let stderr = "";
-  let exited = false;
-  const childExit = new Promise<number>((resolve) => {
-    child.on("exit", (code) => {
-      exited = true;
-      resolve(code ?? 1);
-    });
-  });
-  child.stderr?.on("data", (chunk: Buffer) => {
-    stderr += chunk.toString();
-  });
+  const tempPath = join(getLocksDir(), `.tmp-${finalName}.${process.pid}.${Date.now()}.inflight`);
 
   try {
-    const tempPath = await waitForTmpStateDir(getLocksDir(), finalName, 5_000);
+    await mkdir(tempPath, { recursive: false, mode: 0o700 });
     await sleep(ORACLE_METADATA_WRITE_GRACE_MS + 200);
 
     const removed = await sweepStaleLocks();
     assert(!removed.includes(tempPath), "sweep should not reclaim fresh in-flight .tmp-* lock dirs within the tmp grace window");
     assert(await pathExists(tempPath), "fresh in-flight .tmp-* lock dirs should still exist after a sweep");
 
-    child.stdin?.write("continue\n");
-    child.stdin?.end();
-
-    const exitCode = await childExit;
-    assert(exitCode === 0, `in-flight lock publisher should finish successfully after sweep, got exit ${exitCode}${stderr ? `: ${stderr}` : ""}`);
+    await writeFile(join(tempPath, "metadata.json"), `${JSON.stringify({ processPid: process.pid, source: "oracle-sanity-inflight-publisher" }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    await rename(tempPath, finalPath);
 
     const metadata = JSON.parse(await readFile(join(finalPath, "metadata.json"), "utf8")) as { source?: string };
     assert(metadata.source === "oracle-sanity-inflight-publisher", "in-flight publish should finish by atomically promoting the temp lock dir");
   } finally {
-    if (!exited) child.kill("SIGKILL");
+    await rm(tempPath, { recursive: true, force: true }).catch(() => undefined);
     await rm(finalPath, { recursive: true, force: true }).catch(() => undefined);
   }
 }
@@ -3551,14 +3506,14 @@ async function testOraclePromptTemplateCutover(): Promise<void> {
   assert(toolsSource.includes("queued jobs and retained pre-submit archives"), "queued archive admission errors should explain that stranded pre-submit archives count against the byte cap");
   assert(pkg.files?.includes("prompts"), "package.json files should include prompts");
   assert(pkg.pi?.prompts?.includes("./prompts"), "package.json pi.prompts should include ./prompts");
-  assert(pkg.engines?.node === ">=22.19.0", "package.json should advertise the actual Node.js support floor");
+  assert(pkg.engines?.node === ">=22.19.0 <25", "package.json should advertise the actual Node.js support floor");
   assert(pkg.os?.includes("darwin"), "package.json should declare macOS-only support");
   assert(pkg.scripts?.test === "npm run verify:oracle", "package.json should expose the local verification gate through npm test");
   assert(pkg.scripts?.["typecheck:worker-helpers"] === "tsc --noEmit -p tsconfig.worker-helpers.json", "package.json should statically typecheck extracted worker/auth helpers");
   assert(String(pkg.scripts?.["verify:oracle"] || "").includes("typecheck:worker-helpers"), "full local verification should include worker/auth helper typechecking");
   assert(pkg.scripts?.prepublishOnly === "npm run verify:oracle", "package publishing should be guarded by the full local verification gate");
   assert(pkg.overrides?.["basic-ftp"] === "6.0.1", "package.json should override basic-ftp to the latest patched stable version");
-  assert(pkg.overrides?.protobufjs === "7.5.6", "package.json should override protobufjs to a patched stable version compatible with @google/genai");
+  assert(pkg.overrides?.protobufjs === "7.6.1", "package.json should override protobufjs to a patched stable version compatible with @google/genai");
   assert(commandsSource.includes("Cancel a queued or active oracle job"), "oracle commands should allow queued-job cancellation");
   assert(commandsSource.includes("formatOracleJobSummary"), "oracle commands should format job status output through the shared observability helper");
   assert(commandsSource.includes("recently woken jobs may stay retained briefly"), "oracle-clean help text should mention the short post-send retention grace window");

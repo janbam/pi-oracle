@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## 0.7.3 - 2026-05-27
+
+### Changed
+- updated the local pi development baseline to `@earendil-works/pi-coding-agent` / `@earendil-works/pi-ai` `0.76.0` and regenerated the npm lockfile
+- aligned `engines.node` to `>=22.19.0 <25` with the pi `0.76.0` Node.js floor and the supported Node 22–24 range
+
+### Compatibility
+- reviewed the pi `0.76.0` changelog and package guidance; the oracle extension remains compatible with current extension lifecycle and package install/update behavior
+
+## 0.7.2 - 2026-05-23
+
+### Changed
+- updated the local pi development baseline to `@earendil-works/pi-coding-agent` / `@earendil-works/pi-ai` `0.75.5`, refreshed Node/tsx tooling, and regenerated the npm lockfile
+- updated `@steipete/sweet-cookie` to `0.3.0` for the current browser-cookie extraction baseline
+- refreshed the `protobufjs` override to `7.6.1` for the current patched dependency graph
+
+### Compatibility
+- reviewed the pi `0.75.5` changelog and package guidance; the oracle extension remains compatible with current extension lifecycle and package install/update behavior
+
 ## 0.7.1 - 2026-05-18
 
 ### Changed
