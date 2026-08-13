@@ -13,8 +13,10 @@ import {
   chromeUserAgentPlatformToken,
   chromiumKeychainSupportedOnPlatform,
   defaultCloneStrategyForPlatform,
+  detectDefaultBraveExecutablePath,
   detectDefaultBrowserProfileSource,
   detectDefaultLinuxChromeExecutablePath,
+  detectPatchrightChromiumExecutablePath,
   sweetCookieSafeStoragePasswordScrubbedEnv,
 } from "../shared/browser-profile-helpers.mjs";
 import { getProjectId } from "./runtime.js";
@@ -48,6 +50,14 @@ export type OracleEffort = (typeof EFFORTS)[number];
 
 export const GROK_MODES = ["heavy", "expert", "fast", "auto"] as const;
 export type OracleGrokMode = (typeof GROK_MODES)[number];
+
+// Config-authoring shorthand for browser.executablePath: instead of hardcoding a
+// (possibly version-pinned, machine-specific) absolute path, users can name a known
+// browser engine and let config loading resolve it. Never appears in the validated
+// OracleConfig shape -- applyBrowserEngineOverride resolves and strips it before
+// the config is merged with defaults and validated.
+export const BROWSER_ENGINES = ["brave", "patchright"] as const;
+export type OracleBrowserEngine = (typeof BROWSER_ENGINES)[number];
 
 /**
  * Canonical preset registry for `oracle_submit` preset selection.
@@ -518,6 +528,28 @@ function readJson(path: string): unknown {
   }
 }
 
+function resolveBrowserEngineExecutablePath(engine: OracleBrowserEngine): string | undefined {
+  return engine === "brave" ? detectDefaultBraveExecutablePath() : detectPatchrightChromiumExecutablePath();
+}
+
+// Resolves the browser.engine authoring shorthand into browser.executablePath on
+// the raw (pre-deepMerge) global config, so it is evaluated against the machine
+// loading the config rather than baked into DEFAULT_CONFIG at module init.
+function applyBrowserEngineOverride(config: unknown): unknown {
+  if (!isObject(config) || !isObject(config.browser) || config.browser.engine === undefined) return config;
+  const browser = config.browser;
+  if (browser.executablePath !== undefined) {
+    throw new Error("Invalid oracle config: browser.engine and browser.executablePath cannot both be set. Remove one.");
+  }
+  const engine = expectEnum(browser.engine, "browser.engine", BROWSER_ENGINES);
+  const executablePath = resolveBrowserEngineExecutablePath(engine);
+  if (!executablePath) {
+    throw new Error(`Invalid oracle config: browser.engine="${engine}" could not locate a matching browser executable on this machine. Set browser.executablePath explicitly instead.`);
+  }
+  const { engine: _engine, ...browserWithoutEngine } = browser;
+  return { ...config, browser: { ...browserWithoutEngine, executablePath } };
+}
+
 function expectObject(value: unknown, path: string): Record<string, unknown> {
   if (!isObject(value)) {
     throw new Error(`Invalid oracle config: ${path} must be an object`);
@@ -754,7 +786,7 @@ function validateOracleConfig(value: unknown): OracleConfig {
 
 export function loadOracleConfig(cwd: string, options?: OracleConfigLoadOptions): OracleConfig {
   const details = getOracleConfigLoadDetails(cwd, options);
-  const globalConfig = readJson(details.agentConfigPath);
+  const globalConfig = applyBrowserEngineOverride(readJson(details.agentConfigPath));
   const projectConfig = details.projectConfigLoaded ? filterProjectConfig(readJson(details.projectConfigPath)) : undefined;
   const globalBrowser = isObject(globalConfig) ? globalConfig.browser : undefined;
   const hasConfiguredUserAgent = isObject(globalBrowser) && globalBrowser.userAgent !== undefined;

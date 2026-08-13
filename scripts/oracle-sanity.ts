@@ -1051,6 +1051,77 @@ async function testConfigRejectsChromiumKeychainOffMac(): Promise<void> {
   }
 }
 
+async function testConfigBrowserEngineOverride(): Promise<void> {
+  const fixtureDir = await mkdtemp(join(tmpdir(), "oracle-browser-engine-config-"));
+  const agentExtensionsDir = join(fixtureDir, "agent", "extensions");
+  const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const originalPath = process.env.PATH;
+  const originalPlaywrightBrowsersPath = process.env.PLAYWRIGHT_BROWSERS_PATH;
+  const configPath = join(agentExtensionsDir, "oracle.json");
+
+  const writeConfig = (browser: Record<string, unknown>) =>
+    writeFile(configPath, `${JSON.stringify({ browser }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+
+  try {
+    await mkdir(agentExtensionsDir, { recursive: true, mode: 0o700 });
+    process.env.PI_CODING_AGENT_DIR = join(fixtureDir, "agent");
+
+    // Fixture patchright cache: two revisions, resolution must prefer the newer one.
+    const cacheDir = join(fixtureDir, "ms-playwright");
+    const oldChrome = join(cacheDir, "chromium-1000", "chrome-linux64", "chrome");
+    const newChrome = join(cacheDir, "chromium-2000", "chrome-linux64", "chrome");
+    await mkdir(dirname(oldChrome), { recursive: true });
+    await mkdir(dirname(newChrome), { recursive: true });
+    await writeFile(oldChrome, "#!/bin/sh\n", { mode: 0o700 });
+    await writeFile(newChrome, "#!/bin/sh\n", { mode: 0o700 });
+    await chmod(oldChrome, 0o755);
+    await chmod(newChrome, 0o755);
+
+    // Fixture brave binary on PATH.
+    const braveBinDir = join(fixtureDir, "bin");
+    const braveBinary = join(braveBinDir, "brave");
+    await mkdir(braveBinDir, { recursive: true });
+    await writeFile(braveBinary, "#!/bin/sh\n", { mode: 0o700 });
+    await chmod(braveBinary, 0o755);
+
+    process.env.PLAYWRIGHT_BROWSERS_PATH = cacheDir;
+    process.env.PATH = `${braveBinDir}${delimiter}${originalPath ?? ""}`;
+
+    await writeConfig({ authSeedProfileDir: join(fixtureDir, "seed-profile"), engine: "patchright" });
+    const patchrightConfig = loadOracleConfig(process.cwd());
+    assert(patchrightConfig.browser.executablePath === newChrome, "browser.engine=patchright should resolve to the newest chromium-<revision> build in the Playwright/Patchright cache");
+    assert(!("engine" in patchrightConfig.browser), "browser.engine is a config-authoring shorthand and must not leak into the validated OracleConfig shape");
+
+    await writeConfig({ authSeedProfileDir: join(fixtureDir, "seed-profile"), engine: "brave" });
+    const braveConfig = loadOracleConfig(process.cwd());
+    assert(braveConfig.browser.executablePath === braveBinary, "browser.engine=brave should resolve to the brave executable discovered on PATH");
+
+    await writeConfig({ authSeedProfileDir: join(fixtureDir, "seed-profile"), engine: "brave", executablePath: braveBinary });
+    assertThrows(
+      () => loadOracleConfig(process.cwd()),
+      "config should reject browser.engine combined with an explicit browser.executablePath instead of silently picking a winner",
+      "browser.engine and browser.executablePath cannot both be set",
+    );
+
+    process.env.PATH = braveBinDir; // drop the real PATH so brave cannot be found
+    process.env.PLAYWRIGHT_BROWSERS_PATH = join(fixtureDir, "empty-cache"); // no chromium builds here
+    await writeConfig({ authSeedProfileDir: join(fixtureDir, "seed-profile"), engine: "patchright" });
+    assertThrows(
+      () => loadOracleConfig(process.cwd()),
+      "config should reject browser.engine when no matching executable can be found on this machine",
+      'browser.engine="patchright" could not locate a matching browser executable',
+    );
+  } finally {
+    if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    if (originalPlaywrightBrowsersPath === undefined) delete process.env.PLAYWRIGHT_BROWSERS_PATH;
+    else process.env.PLAYWRIGHT_BROWSERS_PATH = originalPlaywrightBrowsersPath;
+    await rm(fixtureDir, { recursive: true, force: true });
+  }
+}
+
 async function testAuthBootstrapReportsEffectiveConfigPaths(config: OracleConfig): Promise<void> {
   const fixtureDir = await mkdtemp(join(tmpdir(), "oracle-auth-config-guidance-"));
   const projectDir = join(fixtureDir, "project");
@@ -6111,6 +6182,7 @@ async function runPlatformSanity(): Promise<void> {
   testAuthCookiePolicy();
   await testConfigRejectsPartialChromiumKeychain();
   await testConfigRejectsChromiumKeychainOffMac();
+  await testConfigBrowserEngineOverride();
   await testChromiumCookieSourceReadsConfiguredKeychain();
   await testRuntimeConversationLeases(config);
   await testCleanupPendingRecoveryUnblocksAdmission(config);
@@ -6156,6 +6228,7 @@ async function main() {
   testAuthCookiePolicy();
   await testConfigRejectsPartialChromiumKeychain();
   await testConfigRejectsChromiumKeychainOffMac();
+  await testConfigBrowserEngineOverride();
   await testChromiumCookieSourceReadsConfiguredKeychain();
   await testRuntimeConversationLeases(config);
   await testCleanupPendingRecoveryUnblocksAdmission(config);

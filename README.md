@@ -212,6 +212,15 @@ Notes:
 - If the packaged default is fine, omit `defaults`.
 - When an agent is unsure which oracle preset fits, it should omit `preset` and use the configured default model instead of asking by default. If the prompt says to use Grok, it should pass `provider: "grok"` to `oracle_submit`.
 - You usually do not need browser paths unless auto-detection fails.
+- `browser.engine` is a shorthand for `browser.executablePath`: set it to `"brave"` or `"patchright"` and config loading resolves the actual path for you (Brave via PATH/known install locations; Patchright via the newest Chromium build in the Playwright/Patchright browser cache, so it survives Patchright updates without a hardcoded version). Cannot be combined with an explicit `browser.executablePath`.
+
+```json
+{
+  "browser": {
+    "engine": "patchright"
+  }
+}
+```
 
 ### Linux cookie import notes
 

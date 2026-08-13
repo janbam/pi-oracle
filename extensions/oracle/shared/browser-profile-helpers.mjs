@@ -4,7 +4,7 @@
 // Usage: Imported by config.ts, runtime.ts, auth-bootstrap.mjs, run-job.mjs, and sanity tests.
 // Invariants/Assumptions: Real browser profile roots must never be used as oracle seed/runtime profile destinations, even through symlinked ancestors.
 
-import { accessSync, constants as fsConstants, existsSync, realpathSync, readFileSync, statSync } from "node:fs";
+import { accessSync, constants as fsConstants, existsSync, readdirSync, realpathSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 
@@ -56,6 +56,9 @@ const WINDOWS_CHROMIUM_USER_DATA_RELATIVE_DIRS = Object.freeze([
 ]);
 
 const LINUX_CHROME_EXECUTABLE_NAMES = Object.freeze(["google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "brave-browser", "brave"]);
+const LINUX_BRAVE_EXECUTABLE_NAMES = Object.freeze(["brave-browser", "brave"]);
+const DARWIN_BRAVE_EXECUTABLE = "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser";
+const PLAYWRIGHT_CHROMIUM_REVISION_DIR_PATTERN = /^chromium-(\d+)$/;
 
 /**
  * @param {string} value
@@ -396,6 +399,69 @@ export function detectDefaultBrowserProfileSource(platform = process.platform, o
     return readLastUsedProfileName(userDataDir) ?? "Default";
   }
   return "Default";
+}
+
+/**
+ * @param {OraclePlatform} [platform]
+ * @param {ExecutableSearchOptions} [options]
+ * @returns {string | undefined}
+ */
+export function detectDefaultBraveExecutablePath(platform = process.platform, options = {}) {
+  if (platform === "linux") return findExecutableOnPathSync(LINUX_BRAVE_EXECUTABLE_NAMES, options);
+  if (platform === "darwin") return existsSync(DARWIN_BRAVE_EXECUTABLE) ? DARWIN_BRAVE_EXECUTABLE : undefined;
+  return undefined;
+}
+
+/**
+ * Playwright/Patchright's browser cache root, honoring PLAYWRIGHT_BROWSERS_PATH
+ * the same way Playwright itself does. Patchright reuses this cache layout.
+ * @param {OraclePlatform} [platform]
+ * @param {BrowserPathOptions} [options]
+ * @returns {string}
+ */
+export function playwrightBrowsersCacheDir(platform = process.platform, options = {}) {
+  const env = options.env ?? process.env;
+  const configured = env.PLAYWRIGHT_BROWSERS_PATH?.trim();
+  if (configured) return normalizedAbsolutePath(configured, options);
+  const homeDir = options.homeDir ?? homedir();
+  if (platform === "darwin") return join(homeDir, "Library", "Caches", "ms-playwright");
+  if (platform === "win32") return join(homeDir, "AppData", "Local", "ms-playwright");
+  return join(homeDir, ".cache", "ms-playwright");
+}
+
+/**
+ * Finds the newest downloaded Chromium build in the Playwright/Patchright browser
+ * cache and returns its platform executable path. The cache holds multiple
+ * chromium-<revision> directories across upgrades, so this always picks the
+ * highest revision instead of a version-pinned path that would go stale.
+ * Windows is intentionally unsupported here, matching the rest of this module's
+ * chrome-executable detection.
+ * @param {OraclePlatform} [platform]
+ * @param {BrowserPathOptions} [options]
+ * @returns {string | undefined}
+ */
+export function detectPatchrightChromiumExecutablePath(platform = process.platform, options = {}) {
+  if (platform !== "linux" && platform !== "darwin") return undefined;
+  const cacheDir = playwrightBrowsersCacheDir(platform, options);
+  let entries;
+  try {
+    entries = readdirSync(cacheDir);
+  } catch {
+    return undefined;
+  }
+  const revisionDirNames = entries
+    .map((name) => ({ name, match: name.match(PLAYWRIGHT_CHROMIUM_REVISION_DIR_PATTERN) }))
+    .filter(({ match }) => match !== null)
+    .sort((a, b) => Number(b.match[1]) - Number(a.match[1]))
+    .map(({ name }) => name);
+  const relativeExecutable = platform === "darwin"
+    ? join("chrome-mac", "Chromium.app", "Contents", "MacOS", "Chromium")
+    : join("chrome-linux64", "chrome");
+  for (const revisionDirName of revisionDirNames) {
+    const candidate = join(cacheDir, revisionDirName, relativeExecutable);
+    if (isExecutableFileSync(candidate)) return candidate;
+  }
+  return undefined;
 }
 
 /**

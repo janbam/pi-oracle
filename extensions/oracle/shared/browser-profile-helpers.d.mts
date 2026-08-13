@@ -68,6 +68,9 @@ export function assertNotKnownBrowserUserDataPath(
 export function isExecutableFileSync(pathValue: string): boolean;
 export function findExecutableOnPathSync(names: readonly string[], options?: ExecutableSearchOptions): string | undefined;
 export function detectDefaultLinuxChromeExecutablePath(options?: ExecutableSearchOptions): string | undefined;
+export function detectDefaultBraveExecutablePath(platform?: OraclePlatform, options?: ExecutableSearchOptions): string | undefined;
+export function playwrightBrowsersCacheDir(platform?: OraclePlatform, options?: BrowserPathOptions): string;
+export function detectPatchrightChromiumExecutablePath(platform?: OraclePlatform, options?: BrowserPathOptions): string | undefined;
 export function detectDefaultLinuxCookieProfileSource(options?: BrowserPathOptions): string | undefined;
 export function detectDefaultBrowserProfileSource(platform?: OraclePlatform, options?: BrowserPathOptions): string;
 export function scrubSweetCookieSafeStoragePasswordEnv(env?: NodeJS.ProcessEnv): void;
