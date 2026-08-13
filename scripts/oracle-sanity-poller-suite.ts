@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { SessionManager, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { OracleConfig } from "../extensions/oracle/lib/config.ts";
 import {
@@ -129,8 +129,8 @@ async function testPollerNotification(config: OracleConfig): Promise<void> {
   };
   const ctx = createExtensionCtx(sessionManager);
 
-  startPoller(pi as unknown as ExtensionAPI, ctx, 50, "/tmp/fake-oracle-worker.mjs");
-  await waitForCondition(() => (sent.length >= 1 ? true : undefined), { timeoutMs: 1_500, description: "poller wake-up delivery" });
+  startPoller(pi, ctx, 50, "/tmp/fake-oracle-worker.mjs");
+  await waitForCondition(() => (sent.length >= 1 ? true : undefined), { timeoutMs: process.platform === "win32" ? 5_000 : 1_500, description: "poller wake-up delivery" });
   stopPollerForSession(sessionFile, ctx.cwd);
 
   const reopenedSession = SessionManager.open(sessionFile, undefined, process.cwd());
@@ -159,7 +159,7 @@ async function testOracleSubmitRejectsMissingSessionIdentity(): Promise<void> {
   await writeFile(fakeWorkerPath, "process.exit(0);\n", { mode: 0o600 });
 
   const pi = createPiHarness();
-  registerOracleTools(pi as unknown as ExtensionAPI, fakeWorkerPath);
+  registerOracleTools(pi, fakeWorkerPath);
   const submitTool = pi.tools.get("oracle_submit");
   assert(submitTool, "oracle submit tool should register");
 
@@ -183,7 +183,7 @@ async function testOracleReadUsesConfiguredJobsDir(config: OracleConfig): Promis
   await writeFile(fakeWorkerPath, "process.exit(0);\n", { mode: 0o600 });
 
   const pi = createPiHarness();
-  registerOracleTools(pi as unknown as ExtensionAPI, fakeWorkerPath);
+  registerOracleTools(pi, fakeWorkerPath);
   const readTool = pi.tools.get("oracle_read");
   assert(readTool, "oracle read tool should register");
 
@@ -212,8 +212,8 @@ async function testManualReadsSettleWakeupRetries(config: OracleConfig): Promise
   await writeFile(fakeWorkerPath, "process.exit(0);\n", { mode: 0o600 });
 
   const pi = createPiHarness();
-  registerOracleTools(pi as unknown as ExtensionAPI, fakeWorkerPath);
-  registerOracleCommands(pi as unknown as ExtensionAPI, fakeWorkerPath, fakeWorkerPath);
+  registerOracleTools(pi, fakeWorkerPath);
+  registerOracleCommands(pi, fakeWorkerPath, fakeWorkerPath);
   const readTool = pi.tools.get("oracle_read");
   const statusCommand = pi.commands.get("oracle-status");
   assert(readTool, "oracle read tool should register for wake-up settlement coverage");
@@ -291,8 +291,8 @@ async function testPreSendStatusObservationDoesNotSuppressFirstWakeup(config: Or
   await writeFile(fakeWorkerPath, "process.exit(0);\n", { mode: 0o600 });
 
   const pi = createPiHarness();
-  registerOracleTools(pi as unknown as ExtensionAPI, fakeWorkerPath);
-  registerOracleCommands(pi as unknown as ExtensionAPI, fakeWorkerPath, fakeWorkerPath);
+  registerOracleTools(pi, fakeWorkerPath);
+  registerOracleCommands(pi, fakeWorkerPath, fakeWorkerPath);
   const statusCommand = pi.commands.get("oracle-status");
   assert(statusCommand, "oracle status command should register for pre-send observation coverage");
 
@@ -348,7 +348,7 @@ async function testPollerSkipsContendedAdmissionPromotion(config: OracleConfig):
   const pi = createPiHarness();
 
   await withLock("admission", "global", { processPid: process.pid, source: "oracle-sanity-contended-admission" }, async () => {
-    await scanOracleJobsOnce(pi as unknown as ExtensionAPI, createPollerCtx(sessionManager), "/tmp/fake-oracle-worker.mjs");
+    await scanOracleJobsOnce(pi, createPollerCtx(sessionManager), "/tmp/fake-oracle-worker.mjs");
   });
 
   assert(readJob(jobId)?.status === "queued", "poller should skip contended admission promotion without failing the scan");
@@ -372,7 +372,7 @@ async function testOracleExtensionSkipsNoSessionWakeupRouting(config: OracleConf
   pi.sendMessage = (message) => {
     sent.push(message);
   };
-  oracleExtension(pi as unknown as ExtensionAPI);
+  oracleExtension(pi);
   const sessionStart = pi.handlers.get("session_start");
   assert(sessionStart, "oracle extension should register a session_start handler");
 
@@ -386,6 +386,35 @@ async function testOracleExtensionSkipsNoSessionWakeupRouting(config: OracleConf
   assert(sent.length === 0, `oracle extension should not start wake-up routing for no-session contexts, saw ${sent.length}`);
   assert(ui.statuses.some((entry) => entry.value.includes("oracle: unavailable")), "oracle extension should mark oracle unavailable when the current session has no persisted identity");
   await cleanupJob(jobId);
+}
+
+async function testOracleExtensionSkipsPollerInOneShotModes(config: OracleConfig): Promise<void> {
+  for (const mode of ["print", "json"] as const) {
+    await resetOracleStateDir();
+    const sessionManager = createPersistedSessionManager(`poller-${mode}-mode`);
+    const sessionFile = sessionManager.getSessionFile();
+    assert(sessionFile, `${mode} startup test should persist a session file`);
+    const jobId = await createTerminalJob(config, process.cwd(), sessionFile);
+
+    const sent: SentMessageLike[] = [];
+    const pi = createPiHarness();
+    pi.sendMessage = (message) => {
+      sent.push(message);
+    };
+    oracleExtension(pi);
+    const sessionStart = pi.handlers.get("session_start");
+    assert(sessionStart, "oracle extension should register a session_start handler");
+
+    const ui = createUiStub();
+    await sessionStart!({}, createExtensionCtx(sessionManager, ui, process.cwd(), mode));
+    await sleep(250);
+    stopPollerForSession(sessionFile, process.cwd());
+
+    assert(sent.length === 0, `oracle extension should not start wake-up routing in ${mode} mode, saw ${sent.length}`);
+    assert(ui.statuses.length === 0, `oracle extension should not publish oracle UI status in ${mode} mode, saw ${ui.statuses.length}`);
+    assert(!readJob(jobId)?.notifiedAt, `oracle extension should not mark jobs notified from ${mode} mode startup`);
+    await cleanupJob(jobId);
+  }
 }
 
 async function testPersistedSessionsDoNotAdoptLegacyProjectScopedJobs(config: OracleConfig): Promise<void> {
@@ -484,7 +513,7 @@ async function testBranchedSameSessionSkipsDurableNotification(config: OracleCon
     sent.push(message);
   };
 
-  await scanOracleJobsOnce(pi as unknown as ExtensionAPI, createPollerCtx(branchedSessionManager), "/tmp/fake-oracle-worker.mjs");
+  await scanOracleJobsOnce(pi, createPollerCtx(branchedSessionManager), "/tmp/fake-oracle-worker.mjs");
 
   const reopenedSession = SessionManager.open(sessionFile, undefined, process.cwd());
   assert(reopenedSession.getEntries().some((entry) => entry.id === headEntryId), "branched same-session notification handling should preserve the on-disk head entry");
@@ -562,7 +591,7 @@ async function testPreAssistantBranchedSameSessionSkipsDurableNotification(confi
     sent.push(message);
   };
 
-  await scanOracleJobsOnce(pi as unknown as ExtensionAPI, createPollerCtx(branchedSessionManager), "/tmp/fake-oracle-worker.mjs");
+  await scanOracleJobsOnce(pi, createPollerCtx(branchedSessionManager), "/tmp/fake-oracle-worker.mjs");
 
   const skippedSession = SessionManager.open(sessionFile, undefined, process.cwd());
   assert(skippedSession.getEntries().length === 0, "pre-assistant branched same-session notification handling should not flush hidden history by attempting a direct durable append from an older leaf");
@@ -571,7 +600,7 @@ async function testPreAssistantBranchedSameSessionSkipsDurableNotification(confi
   assert(sent.length === 1, `pre-assistant branched same-session notification handling should request exactly one wake-up, saw ${sent.length}`);
 
   branchedSessionManager.branch(modelEntryId);
-  await scanOracleJobsOnce(pi as unknown as ExtensionAPI, createPollerCtx(branchedSessionManager), "/tmp/fake-oracle-worker.mjs");
+  await scanOracleJobsOnce(pi, createPollerCtx(branchedSessionManager), "/tmp/fake-oracle-worker.mjs");
   assert(!findNotificationEntry(SessionManager.open(sessionFile, undefined, process.cwd()), jobId), "restoring the latest in-memory leaf in the live same-session manager should still avoid durable completion-message writes under the best-effort-only model");
   await cleanupJob(jobId);
 }
@@ -595,7 +624,7 @@ async function testNotificationMessagePreservesSessionModel(config: OracleConfig
     sent.push(message);
   };
 
-  await scanOracleJobsOnce(pi as unknown as ExtensionAPI, createPollerCtx(adopterSessionManager), "/tmp/fake-oracle-worker.mjs");
+  await scanOracleJobsOnce(pi, createPollerCtx(adopterSessionManager), "/tmp/fake-oracle-worker.mjs");
 
   const reopenedSession = SessionManager.open(targetSessionFile, undefined, process.cwd());
   const modelAfter = reopenedSession.buildSessionContext().model;
@@ -622,9 +651,7 @@ async function testPollerNotificationAdoptsOrphanedSessionJobs(config: OracleCon
   };
   const ctx = createExtensionCtx(liveSessionManager);
 
-  startPoller(pi as unknown as ExtensionAPI, ctx, 50, "/tmp/fake-oracle-worker.mjs");
-  await waitForCondition(() => (sent.length >= 1 ? true : undefined), { timeoutMs: 1_500, description: "orphaned-job wake-up adoption" });
-  stopPollerForSession(liveSessionFile, ctx.cwd);
+  await scanOracleJobsOnce(pi, ctx, "/tmp/fake-oracle-worker.mjs");
 
   assert(!findNotificationEntry(SessionManager.open(submitterSessionFile, undefined, process.cwd()), jobId), "adopted orphaned jobs should not append a durable completion message into the original target session under the wake-up-only model");
   assert(sent.length >= 1, `expected orphaned job to trigger at least one wake-up request, saw ${sent.length}`);
@@ -670,9 +697,7 @@ async function testPollerDoesNotStealNotificationFromLiveSessionTarget(config: O
   const ctx = createExtensionCtx(liveSessionManager);
 
   try {
-    startPoller(pi as unknown as ExtensionAPI, ctx, 50, "/tmp/fake-oracle-worker.mjs");
-    await waitForAllPollersToQuiesce();
-    stopPollerForSession(liveSessionFile, ctx.cwd);
+    await scanOracleJobsOnce(pi, ctx, "/tmp/fake-oracle-worker.mjs");
 
     assert(sent.length === 0, `expected no notification theft while the original session target is live, saw ${sent.length}`);
     assert(!readJob(jobId)?.notifiedAt, "jobs with a live wake-up target should remain unclaimed by other sessions");
@@ -709,6 +734,10 @@ async function testStoppingPollerCancelsInFlightStaleContextAccess(config: Oracl
       throwIfStale();
       return process.cwd();
     },
+    get mode() {
+      throwIfStale();
+      return "tui" as const;
+    },
     get sessionManager() {
       throwIfStale();
       return sessionManager;
@@ -735,7 +764,7 @@ async function testStoppingPollerCancelsInFlightStaleContextAccess(config: Oracl
 
   process.on("unhandledRejection", onUnhandled);
   try {
-    startPoller(pi as unknown as ExtensionAPI, ctx, 60_000, "/tmp/fake-oracle-worker.mjs", {
+    startPoller(pi, ctx, 60_000, "/tmp/fake-oracle-worker.mjs", {
       hooks: {
         beforeNotificationPersist: async (claimed) => {
           if (claimed.id !== jobId) return;
@@ -749,7 +778,7 @@ async function testStoppingPollerCancelsInFlightStaleContextAccess(config: Oracl
     stale = true;
     stopPollerForSession(sessionFile, process.cwd());
     releaseScan();
-    await waitForAllPollersToQuiesce();
+    await waitForAllPollersToQuiesce(process.platform === "win32" ? 10_000 : 2_000);
     await sleep(25);
   } finally {
     process.off("unhandledRejection", onUnhandled);
@@ -769,7 +798,7 @@ async function testFreshWakeupTargetLeasePublishIsAtomic(): Promise<void> {
   const wakeupTargetLeaseKey = `fresh-wakeup-target-${randomUUID()}`;
   const leasesDir = getLeasesDir();
   const leasePath = hashedOracleStatePath("wakeup-target", wakeupTargetLeaseKey, leasesDir);
-  const finalLeaseDirName = leasePath.split("/").pop() || "";
+  const finalLeaseDirName = basename(leasePath);
   let settled = false;
   const publishPromise = writeLeaseMetadata("wakeup-target", wakeupTargetLeaseKey, {
     leaseKey: wakeupTargetLeaseKey,
@@ -865,7 +894,7 @@ async function testWakeupTargetLeaseRenewalStaysVisibleToAdopters(config: Oracle
       if (!leases.some((lease) => lease.leaseKey === wakeupTargetLeaseKey)) {
         missingLeaseReads += 1;
       }
-      await scanOracleJobsOnce(pi as unknown as ExtensionAPI, createPollerCtx(liveSessionManager), "/tmp/fake-oracle-worker.mjs");
+      await scanOracleJobsOnce(pi, createPollerCtx(liveSessionManager), "/tmp/fake-oracle-worker.mjs");
     }
 
     assert(missingLeaseReads === 0, `wake-up target lease renewal should remain continuously readable during concurrent renewals, saw ${missingLeaseReads} missing reads`);
@@ -919,7 +948,7 @@ async function testPollerDoesNotStealNotificationWhenOriginBecomesLiveAfterClaim
   let activatedOrigin = false;
 
   try {
-    await scanOracleJobsOnce(pi as unknown as ExtensionAPI, ctx, "/tmp/fake-oracle-worker.mjs", {
+    await scanOracleJobsOnce(pi, ctx, "/tmp/fake-oracle-worker.mjs", {
       hooks: {
         afterNotificationClaim: async (claimed) => {
           if (claimed.id !== jobId || activatedOrigin) return;
@@ -1000,7 +1029,7 @@ async function testPollerDoesNotStealNotificationWhenOriginBecomesLiveBeforePers
   let activatedOrigin = false;
 
   try {
-    await scanOracleJobsOnce(pi as unknown as ExtensionAPI, ctx, "/tmp/fake-oracle-worker.mjs", {
+    await scanOracleJobsOnce(pi, ctx, "/tmp/fake-oracle-worker.mjs", {
       hooks: {
         beforeNotificationPersist: async (claimed) => {
           if (claimed.id !== jobId || activatedOrigin) return;
@@ -1060,7 +1089,7 @@ async function testOffSessionWakeupsDoNotWriteTargetSessionHistory(config: Oracl
   const peerSessionManager = SessionManager.open(targetSessionFile, undefined, process.cwd());
 
   let peerEntryId: string | undefined;
-  await scanOracleJobsOnce(pi as unknown as ExtensionAPI, createPollerCtx(adopterSessionManager), "/tmp/fake-oracle-worker.mjs", {
+  await scanOracleJobsOnce(pi, createPollerCtx(adopterSessionManager), "/tmp/fake-oracle-worker.mjs", {
     hooks: {
       beforeNotificationPersist: async (claimed) => {
         if (claimed.id !== jobId || peerEntryId) return;
@@ -1099,7 +1128,7 @@ async function testNotificationClaimRecoveryDoesNotDuplicateWakeups(config: Orac
   };
   const staleRecoveryCtx = createPollerCtx(SessionManager.open(adopterSessionFile, undefined, process.cwd()));
 
-  await scanOracleJobsOnce(pi as unknown as ExtensionAPI, createPollerCtx(adopterSessionManager), "/tmp/fake-oracle-worker.mjs");
+  await scanOracleJobsOnce(pi, createPollerCtx(adopterSessionManager), "/tmp/fake-oracle-worker.mjs");
   assert(sent.length === 1, `first wake-up-only recovery attempt should emit one wake-up, saw ${sent.length}`);
   assert(Boolean(readJob(jobId)?.notifiedAt), "wake-up-only recovery should mark the job notified after the first wake-up attempt");
   assert(!findNotificationEntry(SessionManager.open(targetSessionFile, undefined, process.cwd()), jobId), "wake-up-only recovery should not create a durable completion message in the target session");
@@ -1110,7 +1139,7 @@ async function testNotificationClaimRecoveryDoesNotDuplicateWakeups(config: Orac
     notifyClaimedAt: new Date(Date.now() - 2 * 60 * 1000).toISOString(),
     wakeupLastRequestedAt: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
   }));
-  await scanOracleJobsOnce(pi as unknown as ExtensionAPI, staleRecoveryCtx, "/tmp/fake-oracle-worker.mjs");
+  await scanOracleJobsOnce(pi, staleRecoveryCtx, "/tmp/fake-oracle-worker.mjs");
   assert(sent.length === 1, `already-notified recovery scans should not emit duplicate wake-ups after claim handoff, saw ${sent.length}`);
   assert(Boolean(readJob(jobId)?.notifiedAt), "wake-up-only recovery should keep the job notified after subsequent scans");
   await cleanupJob(jobId);
@@ -1190,7 +1219,7 @@ async function testStalePruneCandidatesDoNotSendWakeups(config: OracleConfig): P
 
   let prunedJobIds: string[] = [];
   const pruneTimestamp = new Date(Date.now() - 2 * 60 * 1000).toISOString();
-  await scanOracleJobsOnce(pi as unknown as ExtensionAPI, createPollerCtx(sessionManager), "/tmp/fake-oracle-worker.mjs", {
+  await scanOracleJobsOnce(pi, createPollerCtx(sessionManager), "/tmp/fake-oracle-worker.mjs", {
     hooks: {
       beforeNotificationClaim: async (candidateJobId) => {
         if (candidateJobId !== jobId || prunedJobIds.length > 0) return;
@@ -1224,7 +1253,7 @@ async function testClaimedJobsBlockRemovalBeforeWakeup(config: OracleConfig): Pr
   };
 
   let removalResult: Awaited<ReturnType<typeof removeTerminalOracleJob>> | undefined;
-  await scanOracleJobsOnce(pi as unknown as ExtensionAPI, createPollerCtx(sessionManager), "/tmp/fake-oracle-worker.mjs", {
+  await scanOracleJobsOnce(pi, createPollerCtx(sessionManager), "/tmp/fake-oracle-worker.mjs", {
     hooks: {
       beforeNotificationPersist: async (claimed) => {
         if (claimed.id !== jobId || removalResult) return;
@@ -1277,7 +1306,7 @@ async function testPostSendWakeupGraceBlocksPrune(config: OracleConfig): Promise
     sent.push(message);
   };
 
-  await scanOracleJobsOnce(pi as unknown as ExtensionAPI, createPollerCtx(sessionManager), "/tmp/fake-oracle-worker.mjs");
+  await scanOracleJobsOnce(pi, createPollerCtx(sessionManager), "/tmp/fake-oracle-worker.mjs");
   assert(sent.length === 1, `post-send prune-grace test should emit exactly one wake-up before pruning is attempted, saw ${sent.length}`);
   const pruned = await pruneTerminalOracleJobs(Date.now() + 10_000);
   assert(!pruned.includes(jobId), "recently sent wake-ups should keep their job files retained during the post-send grace window");
@@ -1285,8 +1314,9 @@ async function testPostSendWakeupGraceBlocksPrune(config: OracleConfig): Promise
   assert(await pathExists(job.responsePath), "post-send prune-grace test should keep the referenced response file on disk during the grace window");
   assert(await pathExists(artifactsDir), "post-send prune-grace test should keep the referenced artifacts directory on disk during the grace window");
   const wakeupContent = String(sent[0]?.content ?? "");
-  assert(wakeupContent.includes(job.responsePath), "post-send prune-grace wake-up should reference the persisted response path");
-  assert(wakeupContent.includes(artifactsDir), "post-send prune-grace wake-up should reference the persisted artifacts directory");
+  const normalizedWakeupContent = wakeupContent.replaceAll("\\", "/");
+  assert(normalizedWakeupContent.includes(job.responsePath.replaceAll("\\", "/")), "post-send prune-grace wake-up should reference the persisted response path");
+  assert(normalizedWakeupContent.includes(artifactsDir.replaceAll("\\", "/")), "post-send prune-grace wake-up should reference the persisted artifacts directory");
   await cleanupJob(jobId);
 }
 
@@ -1313,11 +1343,11 @@ async function testOracleCleanHonorsPostSendWakeupGrace(config: OracleConfig): P
   pi.sendMessage = (message) => {
     sent.push(message);
   };
-  registerOracleCommands(pi as unknown as ExtensionAPI, fakeWorkerPath, fakeWorkerPath);
+  registerOracleCommands(pi, fakeWorkerPath, fakeWorkerPath);
   const cleanCommand = pi.commands.get("oracle-clean");
   assert(cleanCommand, "oracle clean command should register for post-send clean-grace test");
 
-  await scanOracleJobsOnce(pi as unknown as ExtensionAPI, createPollerCtx(sessionManager), "/tmp/fake-oracle-worker.mjs");
+  await scanOracleJobsOnce(pi, createPollerCtx(sessionManager), "/tmp/fake-oracle-worker.mjs");
   assert(sent.length === 1, `post-send clean-grace test should emit exactly one wake-up before clean is attempted, saw ${sent.length}`);
 
   const ui = createUiStub();
@@ -1349,7 +1379,7 @@ async function testPollerWakeupDeliveryIsDedupedWithoutDurableNotifications(conf
     sent.push(message);
   };
 
-  await scanOracleJobsOnce(pi as unknown as ExtensionAPI, createPollerCtx(sessionManager), "/tmp/fake-oracle-worker.mjs");
+  await scanOracleJobsOnce(pi, createPollerCtx(sessionManager), "/tmp/fake-oracle-worker.mjs");
   assert(sent.length >= 1, `expected at least one best-effort wake-up request after the first scan, saw ${sent.length}`);
   assert(!findNotificationEntry(SessionManager.open(sessionFile, undefined, process.cwd()), jobId), "one-time wake-up delivery should not create durable completion messages under the best-effort-only model");
   assert(readJob(jobId)?.wakeupAttemptCount === 1, "first wake-up attempt should record a single reminder request");
@@ -1359,7 +1389,7 @@ async function testPollerWakeupDeliveryIsDedupedWithoutDurableNotifications(conf
     ...job,
     wakeupLastRequestedAt: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
   }));
-  await scanOracleJobsOnce(pi as unknown as ExtensionAPI, createPollerCtx(sessionManager), "/tmp/fake-oracle-worker.mjs");
+  await scanOracleJobsOnce(pi, createPollerCtx(sessionManager), "/tmp/fake-oracle-worker.mjs");
   assert(sent.length === 1, `notified jobs should not emit a second wake-up after backoff, saw ${sent.length}`);
   assert(readJob(jobId)?.wakeupAttemptCount === 1, "deduped wake-up scans should not increment the reminder counter after notification");
 
@@ -1376,6 +1406,7 @@ export async function runPollerSanitySuite(config: OracleConfig): Promise<void> 
   await testPollerNotification(config);
   await testPollerSkipsContendedAdmissionPromotion(config);
   await testOracleExtensionSkipsNoSessionWakeupRouting(config);
+  await testOracleExtensionSkipsPollerInOneShotModes(config);
   await testPersistedSessionsDoNotAdoptLegacyProjectScopedJobs(config);
   await testPollerNotificationSkipsContestedSameSessionWriters(config);
   await testBranchedSameSessionSkipsDurableNotification(config);

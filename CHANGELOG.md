@@ -1,6 +1,206 @@
 # Changelog
 
-## Unreleased
+## 0.7.20 - 2026-07-28
+
+### Fixed
+- accepted undifferentiated ChatGPT Pro compact menus (bare Pro / Instant 5.5) so pro presets can configure without Standard/Extended rows
+- replaced `\S` tool-schema non-blank patterns with a GBNF-safe character class so llama.cpp-backed OpenAI-compatible servers can compile oracle tool schemas
+
+### Validation
+- ran the full `npm run release:check` local gate before release
+
+## 0.7.19 - 2026-07-16
+
+### Changed
+- refreshed the local Pi/pi-ai development lock, sanity contracts, safe-loader version check, and compatibility guidance for Pi 0.80.9; Oracle does not use the removed SDK auth/session options
+
+## 0.7.18 - 2026-07-14
+
+### Changed
+- refreshed the local Pi/pi-ai development lock, sanity contracts, safe-loader version check, and compatibility guidance for Pi 0.80.7
+- updated the local Pi and pi-ai development baseline to 0.80.6
+- switched provider and mode tool schemas to Pi's Google-compatible `StringEnum` helper
+
+### Fixed
+- made the sanity harness independent of the caller's browser profile layout and installed `agent-browser` sessions
+
+## 0.7.17 - 2026-07-01
+
+### Changed
+- clarified oracle prompt/docs validation around provider upload ceilings, Node release-gate requirements, and follow-up dispatch rules
+- centralized provider normalization, project-trust probing, oracle jobs-dir defaults, and timestamp parsing in narrow source-of-truth modules
+
+### Fixed
+- made sanity-runner mode and real-smoke timeout validation fail through tested behavior paths instead of brittle source-string contracts
+- removed duplicate worker/auth helper logic for snapshot parsing, URL normalization, conversation ids, and login-probe normalization
+
+### Validation
+- ran the full `npm run verify:oracle` local gate before release
+
+## 0.7.16 - 2026-06-24
+
+### Changed
+- updated the local pi development and validation baseline to `@earendil-works/*` `0.80.2`
+- exposed packaged `/oracle` and `/oracle-followup` prompt templates through the package manifest so TUI slash completion can discover them
+- reduced always-on `oracle_submit` prompt metadata while keeping detailed dispatch rules in the prompt templates
+
+### Fixed
+- made `/oracle-*` command output visible in JSON mode through a displayed custom message instead of UI notifications only
+- deferred Chrome user-agent probing until oracle config is loaded, with a timeout on the Chrome version probe
+
+## 0.7.15 - 2026-06-23
+
+### Changed
+- updated the local pi development and validation baseline to `@earendil-works/*` `0.80.1`
+- refreshed oracle README and sanity contracts for pi `0.80.1`
+- moved script-only `@earendil-works/pi-ai` type imports to `@earendil-works/pi-ai/compat`, matching the Pi 0.80 source typechecking migration guidance
+
+### Compatibility
+- reviewed the pi `0.80.0` and `0.80.1` changelogs plus current extension lifecycle, project-trust, security, and package docs; no oracle runtime behavior change was required
+
+### Validation
+- ran `npm run release:check`, including `npm run verify:oracle`, fresh live ChatGPT preset proof for every canonical preset, and Crabbox macOS, Ubuntu, and Windows native `platform-build` plus `real-extension` suites
+
+## 0.7.14 - 2026-06-22
+
+### Changed
+- updated the local pi development and validation baseline to `@earendil-works/*` `0.79.10`
+- refreshed oracle docs and sanity contracts for pi `0.79.10`, and removed the obsolete fleet-tested marker
+
+### Fixed
+- used pi's exported `CONFIG_DIR_NAME` for project config and workspace-root detection instead of hardcoding `.pi`
+- clarified `oracle_preflight` path labels so isolated-session probes distinguish the current persisted session from the provider auth seed profile
+- fixed ChatGPT response completion detection for the current DOM, where assistant text uses `data-message-author-role="assistant"` without legacy `.message-bubble` nodes
+
+### Compatibility
+- reviewed the pi `0.79.10` changelog, extension lifecycle docs/types, compaction event docs, project-trust docs, and package/update docs; no oracle compaction hook changes were required
+
+### Validation
+- ran `npm run verify:oracle`, `npm run smoke:real:packed`, source-mode isolated pi model-agent smoke with the `instant` preset, and `npm run smoke:platform:all`
+
+## 0.7.13 - 2026-06-15
+
+### Added
+- added a release-blocking ChatGPT preset proof gate (`npm run release:proof:chatgpt-presets`) so publishing requires fresh loaded-extension evidence for every canonical ChatGPT preset
+
+### Fixed
+- fixed compact ChatGPT Intelligence menu handling so selected thinking tiers that close back to `Medium`, `High`, or `Extra High` composer pills are accepted only after an intentional matching menu click instead of falling through to the removed legacy effort dropdown
+- fixed `instant_auto_switch` under the compact ChatGPT UI, where the legacy auto-switch control is absent after selecting the compact `Instant` tier
+- made ChatGPT model-configuration opening tolerate slower compact-UI hydration before reporting UI drift
+- stabilized archive creation when the compression subprocess exits before tar, so the worker terminates upstream tar immediately instead of waiting for the archive timeout
+- surfaced provider rate-limit/outage modals explicitly during ChatGPT model setup, upload, send, and response waits instead of reporting generic UI drift
+
+## 0.7.12 - 2026-06-15
+
+### Changed
+- switched Grok oracle submissions to gzip-compressed tar archives (`.tar.gz`) so Grok can extract uploaded context without `zstd`
+- centralized provider archive policy for archive format, upload ceiling, and local compression prerequisites
+- split oracle archive construction out of the agent-facing tool orchestration module
+
+### Fixed
+- preserved ChatGPT `.tar.zst` submissions and `zstd` preflight requirements when ChatGPT is explicitly selected while Grok is the configured default provider
+
+### Validation
+- ran the full `npm run verify:oracle` release gate
+- verified isolated local `pi` submissions create extractable Grok `.tar.gz` and explicit ChatGPT `.tar.zst` archives
+
+## 0.7.11 - 2026-06-15
+
+### Changed
+- updated the local pi development and validation baseline to `@earendil-works/*` `0.79.4`
+- refreshed oracle docs and sanity-check baselines for pi `0.79.4`
+
+### Validation
+- ran the full `npm run verify:oracle` release gate under pi `0.79.4`
+
+## 0.7.10 - 2026-06-13
+
+### Added
+- added explicit existing ChatGPT browser-thread targeting for `/oracle`, `oracle_preflight`, and `oracle_submit` through optional `chatGptConversationId`, accepting raw ChatGPT conversation ids or full `https://chatgpt.com/c/...` / `https://chat.openai.com/c/...` URLs while preserving fresh-thread defaults when omitted
+
+### Validation
+- verified existing-thread preflight and submit flows in isolated `pi` sessions, including persisted `chatUrl` / `conversationId` job metadata with a fake worker
+- ran the full `npm run verify:oracle` release gate
+
+## 0.7.9 - 2026-06-11
+
+### Fixed
+- made oracle workers launch their isolated Chrome runtime directly and attach `agent-browser` via DevTools, avoiding failures when unrelated `agent-browser` sessions or daemons are already running
+- tightened worker-owned browser cleanup so runtime profiles are deleted only after the isolated Chrome process has been closed or terminated
+- rejected `browser.args` overrides that would bypass oracle-managed Chrome profile or DevTools isolation
+
+### Validation
+- verified ChatGPT and Grok oracle smoke tests against the local source extension after the worker-owned browser launch fix
+
+## 0.7.8 - 2026-06-11
+
+### Changed
+- updated the local pi development baseline to `@earendil-works/pi-coding-agent` / `@earendil-works/pi-ai` `0.79.1` and regenerated the npm lockfile
+- documented `pi` `0.79.1+` as the suggested tested floor while keeping pi runtime packages as optional wildcard peers so npm peer ranges do not block users from trying newer pi releases
+- updated isolated local-extension and packed package validation workflows to pass explicit `--approve` when they intentionally trust their temporary project fixtures under Pi 0.79.1 project-trust rules
+- made TUI `/oracle` and `/oracle-followup` commands reappear as compact user messages for prompt-history/up-arrow recall while keeping verbose dispatch instructions hidden
+
+### Fixed
+- made project-local `.pi/extensions/oracle.json` overrides honor Pi's effective project trust decision (`ctx.isProjectTrusted()`), including `--no-approve` and saved “do not trust” decisions while preserving the historical default of loading safe project overrides for existing oracle users
+- updated ChatGPT model-selection handling for the current compact selector labels, including `Extra High`, `Pro Standard`, and `Pro Extended`
+- hardened ChatGPT/Grok send handling so oracle workers require provider acceptance evidence before entering `awaiting_response`, preventing unsent composer drafts from masquerading as running jobs
+- dismissed ChatGPT Pro feedback dialogs during model configuration instead of mistaking their generic `Close` control for configuration UI
+
+### Compatibility
+- reviewed the pi `0.79.1` changelog, project-trust docs, extension docs, package docs, prompt-template docs, SDK/RPC exports, and matching examples; the oracle extension remains compatible with current extension lifecycle and package install/update behavior
+
+## 0.7.7 - 2026-06-08
+
+### Changed
+- updated the local pi development baseline to `@earendil-works/pi-coding-agent` / `@earendil-works/pi-ai` `0.79.0` and regenerated the npm lockfile
+- documented `pi` `0.79.0+` as the suggested tested floor while keeping pi runtime packages as optional wildcard peers so npm peer ranges do not block users from trying newer pi releases
+- updated isolated local-extension and packed package validation workflows to pass explicit `--approve` when they intentionally trust their temporary project fixtures under Pi 0.79.0 project-trust rules
+
+### Fixed
+- made project-local `.pi/extensions/oracle.json` overrides honor explicit Pi project-trust opt-outs (`--no-approve` or a saved “do not trust” decision) while preserving the historical default of loading safe project overrides for existing oracle users
+
+### Compatibility
+- reviewed the pi `0.79.0` changelog, project-trust docs, extension docs, package docs, prompt-template docs, SDK/RPC exports, and matching examples; the oracle extension remains compatible with current extension lifecycle and package install/update behavior
+
+## 0.7.6 - 2026-06-04
+
+### Changed
+- updated the local pi development baseline to `@earendil-works/pi-coding-agent` / `@earendil-works/pi-ai` `0.78.1` and regenerated the npm lockfile
+- documented `pi` `0.78.1+` as the suggested tested floor while keeping pi runtime packages as optional wildcard peers so newer pi releases are not blocked by npm peer ranges
+- added Ant Ling, NVIDIA NIM, and MiniMax China provider env mappings to the oracle real-smoke/platform-smoke provider metadata
+
+### Fixed
+- made startup poller and wake-up routing mode-aware with Pi 0.78.1 `ctx.mode`, so print and JSON one-shot runs do not start background pollers or publish oracle UI status
+- guarded oracle startup status and warning notifications with `ctx.hasUI` for non-UI modes
+
+### Compatibility
+- reviewed the pi `0.78.1` changelog, extension docs, package docs, prompt-template docs, and matching examples; the oracle extension remains compatible with current extension lifecycle and package install/update behavior
+
+## 0.7.5 - 2026-06-02
+
+### Added
+- added a Crabbox platform release smoke gate for macOS, Ubuntu, and Windows native with doctor-first validation, packed-install real-extension proof, stop evidence, and platform artifacts
+- added canonical workflow docs and scripts for everyday local validation, focused platform-sensitive runs, and full release/publish smoke coverage
+
+### Changed
+- made the default packed real smoke deterministic by installing the packed package into a clean pi project and invoking the installed `oracle_submit` tool path without waiting on a model-agent turn
+- made Windows native a supported package OS and moved reusable Windows smoke dependencies into the Parallels template/snapshot workflow
+
+### Fixed
+- hardened Windows archive/process/profile handling, including taskkill cleanup, executable resolution, tar/zstd archive behavior, path safety, and auth-bootstrap absolute-path checks
+- removed production `as unknown as` casts and switched Linux/Windows runtime profile copies to Node recursive copy instead of relying on POSIX `cp`
+
+### Validation
+- verified `npm run verify:oracle`, `git diff --check`, and `npm run smoke:platform:all` across macOS, Ubuntu, and Windows native before release
+
+## 0.7.4 - 2026-05-28
+
+### Changed
+- updated the local pi development baseline to `@earendil-works/pi-coding-agent` / `@earendil-works/pi-ai` `0.77.0` and regenerated the npm lockfile
+- kept pi runtime packages as optional wildcard peers and removed the Node.js engine upper bound so future pi releases are not blocked at install time
+
+### Compatibility
+- reviewed the pi `0.77.0` changelog and package guidance; the oracle extension remains compatible with current extension lifecycle and package install/update behavior
 
 ## 0.7.3 - 2026-05-27
 
@@ -57,6 +257,7 @@
 
 ### Changed
 - made `/oracle-auth` success and failure output easier to scan, with compact source summaries and source-specific troubleshooting for configured Chromium cookie sources
+- expanded package support to Linux, using ordinary profile copies off macOS and documenting `@steipete/sweet-cookie`'s Linux keyring/password options for Chromium cookie import
 - tightened README quickstart/command wording around preflight-first `/oracle` behavior, context-rich archive selection, cleanup retention, and preset defaults
 - added the resolved oracle model preset snapshot to `oracle_submit` queued/dispatched output so agents can see what preset will run
 - clarified `oracle_preflight` output so users can see that it validates the persisted pi session, local config, and ChatGPT auth seed created by `oracle_auth`

@@ -1,13 +1,14 @@
 # pi-oracle design
 
-Status: isolated-profile concurrency architecture implemented in code; major live validation now passes, but a few non-blocking hardening items remain.
-Date: 2026-04-03
+Status: isolated-profile concurrency architecture implemented in code and validated against the current pi baseline.
+Date: 2026-06-04
 
 Companion doc:
 - `docs/ORACLE_RECOVERY_DRILL.md` — safe expired-auth recovery validation drill
 
 Compatibility target:
-- `pi` 0.65.0+
+- `pi` 0.80.9+ is the suggested tested floor for current project-trust-aware package/runtime validation
+- package metadata keeps pi runtime packages as optional wildcard peers, so this suggested floor is not enforced as a hard npm install requirement
 - current extension lifecycle only; no backward-compatibility shims for removed `session_switch` / `session_fork` events
 
 ## Goal
@@ -16,7 +17,7 @@ Create a `pi` extension that lets the user or agent consult ChatGPT.com or Grok 
 
 - manual invocation via `/oracle ...`
 - automatic invocation by the agent in rare high-difficulty cases
-- mandatory project-context archive upload (`.tar.zst`)
+- mandatory project-context archive upload (`.tar.zst` for ChatGPT, `.tar.gz` for Grok)
 - long-running execution in the background
 - durable response/artifact persistence plus best-effort wake-the-agent behavior when the oracle response is ready
 - oracle requires a persisted pi session identity; in-memory/no-session contexts are rejected instead of risking cross-session wake-up misdelivery
@@ -59,14 +60,15 @@ The extension now follows the current `pi` session lifecycle model:
 - previous runtimes are expected to clean up in `session_shutdown`
 - no new logic depends on removed post-transition events
 
-### Prompt template
+### Oracle dispatch commands
 
 - `/oracle <request>`
-  - implemented as a prompt template, not an extension command
+  - in TUI mode, intercepted by the extension before prompt-template expansion so verbose internal workflow rules stay hidden from the visible transcript
+  - injects the detailed dispatch instructions as a hidden custom message
+  - in print/json/rpc modes, the extension contributes the prompt templates so non-interactive prompt expansion still works
   - asks the agent to gather context and dispatch an oracle job
-  - intentionally uses native pi prompt/template queueing so submissions survive streaming and compaction
 - `/oracle-followup <job-id> <request>`
-  - implemented as a prompt template, not an extension command
+  - follows the same hidden-instructions TUI path and print/json prompt-template fallback
   - asks the agent to continue an earlier oracle job in the same provider thread via `followUpJobId`
   - keeps same-thread continuation available to normal users without requiring raw tool-call syntax
 
@@ -105,15 +107,15 @@ The extension now follows the current `pi` session lifecycle model:
 ### `/oracle ...`
 
 `/oracle <request>` should not directly drive ChatGPT or Grok.
-It expands through the prompt-template path so pi can apply its native queueing semantics before the agent starts work.
+In TUI mode, the extension intercepts it before prompt-template expansion, re-injects the compact slash request as the visible user message so prompt-history/up-arrow recall survives session reloads, injects hidden dispatch instructions before the agent starts, and shows only compact user-facing status. In print/json/rpc modes, the extension exposes the prompt template so one-shot `/oracle` still expands and runs normally.
 
-Instead it instructs the agent to:
+It instructs the agent to:
 
 1. call `oracle_preflight` immediately, passing `provider: "grok"` when the user explicitly asks for Grok
 2. stop right away if preflight reports the session or local oracle setup is not ready
 3. understand whether the request is explicitly narrow or genuinely broad
-4. if the immediately preceding oracle run failed because ChatGPT or Grok login is required or the worker explicitly said to rerun `/oracle-auth`, call `oracle_auth` once before retrying
-5. gather enough repo context to submit well and bias toward context-rich archives when they fit within the provider ceiling: 250 MB for ChatGPT and 200 MiB for Grok
+4. if auth is missing, stale, or the worker explicitly said to rerun `/oracle-auth`, stop and tell the user to run `/oracle-auth` rather than launching auth automatically
+5. gather enough repo context to submit well and bias toward context-rich archives when they fit within the provider ceiling: 250 MiB for ChatGPT and 200 MiB for Grok
 6. if the request is narrow, start from the directly relevant area but still include nearby tests, docs, config, and adjacent modules when they may improve answer quality
 7. if the request is broad/repo-wide, gather broader context and usually archive `.`
 8. if `oracle_submit` fails before dispatch with an `archive_too_large` / upload-limit error, treat that as retryable: use the reported size summary plus any auto-pruned paths to cut scope and retry automatically with a smaller archive
@@ -155,7 +157,10 @@ The authenticated seed profile remains the source of truth for future oracle run
 Agent-facing submissions resolve a provider first. ChatGPT submissions use **`preset`**; the canonical registry is `ORACLE_SUBMIT_PRESETS` in `extensions/oracle/lib/config.ts`. Grok submissions use **`mode: "heavy"`** today and reject ChatGPT-only presets. For ChatGPT, **`preset` is the only model-selection parameter** on `oracle_submit`; there are no `modelFamily`, `effort`, or `autoSwitchToThinking` fields. Submit-time inputs accept canonical preset ids plus matching human-readable labels/common hyphen-space variants, and the tool normalizes them back to the canonical id before persisting job state. Prompt-template guidance biases toward omitting provider/model fields and using configured defaults unless the task or user explicitly asks for one. It also biases toward context-rich archives up to the provider ceiling, narrowing only when the user explicitly asks for a tight archive, privacy/sensitivity requires it, or size pressure forces it. When local archive creation still exceeds that ceiling after default exclusions and whole-repo auto-pruning, prompt guidance now treats the failure as a retryable archive-selection miss rather than a terminal dead end: agents should cut scope automatically, retry once or twice, and only surface the cut decisions if the archive still cannot fit.
 
 1. resolve the provider and preset/mode (submit-time or config default) into an execution snapshot
-2. resolve optional `followUpJobId` into a prior `chatUrl` and `conversationId`
+2. resolve optional thread targeting:
+   - `followUpJobId` into a prior oracle job `chatUrl` and `conversationId`, or
+   - `chatGptConversationId` into a user/browser-created ChatGPT `https://chatgpt.com/c/<id>` URL
+   Omit both for the default fresh-thread behavior.
 3. build the archive first into a temporary path
 4. allocate a unique runtime:
    - `runtimeId`
@@ -164,7 +169,7 @@ Agent-facing submissions resolve a provider first. ChatGPT submissions use **`pr
 5. under the global admission lock, first promote any older queued jobs that can now run
 6. if runtime capacity is still available:
    - acquire the runtime lease
-   - acquire the conversation lease for follow-up jobs
+   - acquire the conversation lease for same-thread jobs, including follow-ups and explicit existing ChatGPT conversation ids
    - create `${PI_ORACLE_JOBS_DIR:-/tmp}/oracle-<job-id>/...` job state as `submitted`
 7. otherwise create `${PI_ORACLE_JOBS_DIR:-/tmp}/oracle-<job-id>/...` job state as `queued`
 8. move the prepared archive into the job directory with a unique filename
@@ -182,7 +187,8 @@ Per job:
    - the job’s `runtimeProfileDir`
    - headless by default
 3. open either:
-   - the saved `chatUrl` for follow-up jobs, or
+   - the saved `chatUrl` for follow-up jobs,
+   - the normalized `chatGptConversationId` URL for explicit existing ChatGPT browser threads, or
    - the configured provider URL
 4. classify page state before touching the UI
 5. fail fast on:
@@ -228,9 +234,7 @@ Merged config locations:
 - global: `~/.pi/agent/extensions/oracle.json`
 - project: `.pi/extensions/oracle.json`
 
-Project config remains restricted to safe overrides only.
-
-Browser/auth settings are global-only because they control local privileged browser state.
+Project config remains restricted to safe overrides only. On Pi 0.79+, pi itself gates project-local inputs behind project trust, but `pi-oracle` keeps its historical risk-on extension behavior for this package-specific safe override file: `.pi/extensions/oracle.json` loads by default for compatibility, and is ignored when Pi reports the project is untrusted, including `--no-approve` or saved “do not trust” decisions. This preserves the existing extension experience while still honoring explicit opt-out/distrust decisions. Browser/auth settings remain global-only because they control local privileged browser state.
 
 ### Current config shape
 
@@ -246,7 +250,7 @@ Browser/auth settings are global-only because they control local privileged brow
     "authSeedProfileDir": "<absolute path to oracle auth seed profile>",
     "runtimeProfilesDir": "<absolute path to oracle runtime profiles dir>",
     "maxConcurrentJobs": 2,
-    "cloneStrategy": "apfs-clone",
+    "cloneStrategy": "copy",
     "chatUrl": "https://chatgpt.com/",
     "authUrl": "https://chatgpt.com/auth/login",
     "runMode": "headless",
@@ -260,7 +264,7 @@ Browser/auth settings are global-only because they control local privileged brow
     "chromeProfile": "<optional Chrome/Chromium profile name>",
     "chromeCookiePath": "<optional absolute path to Chromium Cookies DB>",
     "chromiumKeychain": {
-      "account": "<macOS Keychain account for non-built-in Chromium browsers>",
+      "account": "<macOS-only Keychain account for non-built-in Chromium browsers>",
       "services": ["<safe-storage service name>"],
       "label": "<optional human-readable label>"
     }
@@ -282,9 +286,13 @@ Browser/auth settings are global-only because they control local privileged brow
 }
 ```
 
-`auth.chromiumKeychain` is an opt-in alternate cookie source for Chromium-family browsers that are not handled by the default `@steipete/sweet-cookie` Chrome-compatible importer. It must be configured with `auth.chromeCookiePath`; partial config is rejected so `/oracle-auth` cannot silently fall back to a different browser profile.
+`browser.cloneStrategy` defaults to `apfs-clone` on macOS and `copy` on Linux/Windows. macOS APFS clone mode uses `cp -cR` and preflights `cp`; set `PI_ORACLE_CP_PATH` only when the default PATH lookup cannot find the intended copy executable. Linux and Windows runtime profile copies use Node's recursive copy instead of depending on POSIX `cp`.
 
-When both `auth.chromeCookiePath` and `auth.chromiumKeychain` are present, auth bootstrap:
+The default `/oracle-auth` cookie importer delegates to `@steipete/sweet-cookie`'s Chrome/Chromium backend. On Linux, pi-oracle auto-detects existing Google Chrome, Chromium, Chromium Browser, or Brave profile roots under `${XDG_CONFIG_HOME:-~/.config}` and passes non-Google roots as absolute profile paths so Sweet Cookie reads the intended cookie DB. pi-oracle does not currently select Sweet Cookie's Edge or Firefox backends. Encrypted Linux Chromium cookies are handled by Sweet Cookie via `secret-tool`, `kwallet-query`/`dbus-send`, `SWEET_COOKIE_LINUX_KEYRING=gnome|kwallet|basic`, or the `SWEET_COOKIE_CHROME_SAFE_STORAGE_PASSWORD` / `SWEET_COOKIE_BRAVE_SAFE_STORAGE_PASSWORD` overrides. Prefer keyring helpers over password environment variables; if a password override is used for `/oracle-auth`, pi-oracle scrubs it before launching browser/helper subprocesses after cookie import.
+
+`auth.chromiumKeychain` is a macOS-only opt-in alternate cookie source for Chromium-family browsers that are not handled by the default `@steipete/sweet-cookie` Chrome-compatible importer. It must be configured with `auth.chromeCookiePath`; partial config is rejected so `/oracle-auth` cannot silently fall back to a different browser profile. On Linux, valid config should leave `auth.chromiumKeychain` unset and use Sweet Cookie's Linux keyring/password options instead.
+
+When both `auth.chromeCookiePath` and `auth.chromiumKeychain` are present on macOS, auth bootstrap:
 
 1. reads the configured macOS Keychain safe-storage password using `account` and the ordered `services` list
 2. snapshots the Chromium `Cookies` DB plus `Cookies-wal` / `Cookies-shm` sidecars, tolerating sidecars that disappear while the browser is closing
@@ -292,7 +300,7 @@ When both `auth.chromeCookiePath` and `auth.chromiumKeychain` are present, auth 
 4. dedupes duplicate cookie rows by keeping the first row after newest-expiry ordering
 5. filters importable provider auth cookies and seeds the isolated oracle auth profile
 
-Operational requirements for this path:
+Operational requirements for this macOS-only path:
 
 - ChatGPT or Grok must already be logged in in the configured browser profile, depending on the provider being synced.
 - The target browser should be fully quit before `/oracle-auth` so the cookie DB snapshot is stable.
@@ -332,7 +340,8 @@ Default location: `${PI_ORACLE_JOBS_DIR:-/tmp}/oracle-<job-id>/`
 ${PI_ORACLE_JOBS_DIR:-/tmp}/oracle-<job-id>/
   job.json
   prompt.md
-  context-<job-id>.tar.zst
+  context-<job-id>.tar.zst   # ChatGPT
+  context-<job-id>.tar.gz    # Grok
   response.md
   artifacts.json
   artifacts/
@@ -491,11 +500,13 @@ Same-thread continuity is persisted as data, not runtime browser state.
 
 Approach:
 
-- expose `/oracle-followup <job-id> <request>` as the user-facing way to continue the same provider thread later
+- expose `/oracle-followup <job-id> <request>` as the user-facing way to continue an oracle-created provider thread later
+- allow `/oracle`/`oracle_submit` to opt into a browser-created ChatGPT thread only when the user explicitly supplies `chatGptConversationId` as a raw id or `https://chatgpt.com/c/...` URL
 - store `chatUrl` only after the conversation URL stabilizes
 - derive and persist `conversationId` from that URL when possible
 - for a follow-up job, resolve `followUpJobId` to the prior `chatUrl`
-- acquire a conversation lease before launching the follow-up
+- for an explicit existing ChatGPT thread, normalize `chatGptConversationId` to `https://chatgpt.com/c/<id>` without requiring prior oracle job state
+- acquire a conversation lease before launching the same-thread job
 - launch a fresh isolated browser using a fresh runtime clone of the auth seed
 - open that URL
 - continue there if authentication and page-state checks pass
@@ -560,7 +571,7 @@ Retained from the earlier MVP:
 - `oracle_auth`, `oracle_submit`, `oracle_read`, `oracle_cancel`
 - detached background worker model
 - `${PI_ORACLE_JOBS_DIR:-/tmp}/oracle-<job-id>/...` state layout
-- shell-safe archive creation using `tar` piped to `zstd`
+- shell-safe archive creation using tar streams: `zstd` compression for ChatGPT and gzip compression for Grok
 - private permissions and atomic writes
 - stale-worker reconciliation
 - upload ordering: attach → confirm → fill → send
@@ -597,7 +608,7 @@ Live-validated after the concurrency redesign:
 
 Still to verify live after this pivot:
 
-- model-selection verification against the current ChatGPT UI under additional real-world variation
+- full ChatGPT preset release matrix evidence must be refreshed before any release; `npm run release:proof:chatgpt-presets` blocks release without one completed loaded-extension ChatGPT job for every canonical preset
 - optional richer terminal semantics for partial artifact failure (`complete_with_artifact_errors`) in more live scenarios
 
 ## Production readiness criteria
@@ -618,7 +629,7 @@ This architecture is now live-validated for the core release path:
 ### Current readiness summary
 
 Current release blockers for the validated scope:
-- none currently known
+- release is blocked until fresh loaded-extension ChatGPT preset proof passes `npm run release:proof:chatgpt-presets` for every canonical `ORACLE_SUBMIT_PRESETS` id
 
 Remaining non-blocking hardening work:
 - broaden live proof of the new lifecycle/state-machine model across more degraded paths
@@ -628,8 +639,29 @@ Remaining non-blocking hardening work:
 - keep hardening model-selection verification against future ChatGPT UI variation
 
 Recent proof points:
+- Pi 0.80.7 local gate: `npm run verify:oracle` passed on 2026-07-14, including syntax/bundle checks, both typechecks, the isolated sanity harness, and `npm pack --dry-run`
+- Pi 0.80.7 safe loader smokes: `.artifacts/real-smoke/run-1784068526377-67yb2l` passed source loading, and `.artifacts/real-smoke/run-1784068527234-t2a5xm` passed packed-install loading through the real Pi CLI; both executed `/oracle-status` without creating an external oracle job or requiring provider credentials
+- Pi 0.80.6 local gate: `npm run verify:oracle` passed three consecutive runs on 2026-07-11; each run completed syntax/bundle checks, both typechecks, the isolated sanity harness, and `npm pack --dry-run` without an `ENOTEMPTY` cleanup failure
+- Pi 0.80.6 safe loader smokes: `.artifacts/real-smoke/run-1783810473367-cn72at` passed source loading, and `.artifacts/real-smoke/run-1783810475290-hj0pfs` passed packed-install loading through the real Pi CLI; both recorded `pi --version` as 0.80.6 and executed `/oracle-status` without creating an external oracle job or requiring provider credentials
+- Pi 0.80.2 local gate: `npm run verify:oracle` passed on 2026-06-24 after the JSON command output, prompt-manifest, schema, and lazy Chrome-probe audit fixes
+- Pi 0.80.2 isolated extension smokes: `.artifacts/real-smoke/run-1782321054924-jnq0x3` passed source proof, and `.artifacts/real-smoke/run-1782321056224-yuq5a2` passed packed-install proof
+- Pi 0.80.2 JSON command smoke: `pi --no-extensions -e ./extensions/oracle/index.ts --mode json --no-session --no-approve "/oracle-status"` emitted displayed `oracle-command-output` JSON events
+- Pi 0.79.10 local gate: `npm run verify:oracle` passed on 2026-06-22 after the 0.79.10 baseline refresh and `CONFIG_DIR_NAME` cleanup
+- Pi 0.79.10 isolated extension smokes: `.artifacts/real-smoke/run-1782137209549-0xe67z` passed packed-install proof, and `.artifacts/real-smoke/run-1782137217821-95a1po` passed source model-agent proof
+- Pi 0.79.10 platform artifacts: `.artifacts/platform-smoke/run-1782137574391-7lay68` (macOS platform-build), `.artifacts/platform-smoke/run-1782137619352-gku7jz` (macOS real-extension), `.artifacts/platform-smoke/run-1782137587082-d7kg4p` (Ubuntu platform-build), `.artifacts/platform-smoke/run-1782137619176-lgxezy` (Ubuntu real-extension), `.artifacts/platform-smoke/run-1782137625964-66z0oc` (Windows native platform-build), `.artifacts/platform-smoke/run-1782137752969-pbmdj1` (Windows native real-extension)
+- Pi 0.79.10 isolated agent feedback: `.artifacts/isolated-agent-feedback/run-1782137385` confirmed local extension loading and useful `oracle_preflight` output after the path-label polish
+- Pi 0.79.1 release gate: `npm run release:check` passed on 2026-06-11 after the project-trust, prompt-history, ChatGPT selector, and send-acceptance updates, including `verify:oracle` plus Crabbox macOS, Ubuntu, and Windows native `platform-build` and `real-extension` suites
+- Pi 0.79.1 platform artifacts: `.artifacts/platform-smoke/run-1781196218405-311wzs` (macOS platform-build), `.artifacts/platform-smoke/run-1781196261807-eb0391` (macOS real-extension), `.artifacts/platform-smoke/run-1781196230636-ze1hai` (Ubuntu platform-build), `.artifacts/platform-smoke/run-1781196265638-kxiwh9` (Ubuntu real-extension), `.artifacts/platform-smoke/run-1781196255488-ucuf35` (Windows native platform-build), `.artifacts/platform-smoke/run-1781196369098-4qlzjs` (Windows native real-extension)
+- Pi 0.79.1 live source-extension send-acceptance smoke: new-chat job `4b98776f-d422-4bfb-8a6a-7aef73c31bf6` reached `https://chatgpt.com/c/6a2ac99d-fc5c-83e8-88d7-5e1e8f427499` and completed; same-thread follow-up job `abb4f590-96a1-4aab-b91a-c0a7cc15a162` completed on the unchanged conversation URL after send-acceptance evidence
+- Pi 0.79.0 release gate: `npm run release:check` passed on 2026-06-08, including `verify:oracle` plus Crabbox macOS, Ubuntu, and Windows native `platform-build` and `real-extension` suites
+- Pi 0.79.0 platform artifacts: `.artifacts/platform-smoke/run-1780938522145-50q2f2` (macOS platform-build), `.artifacts/platform-smoke/run-1780938572090-bi87g5` (macOS real-extension), `.artifacts/platform-smoke/run-1780938542847-quridb` (Ubuntu platform-build), `.artifacts/platform-smoke/run-1780938587248-c8uo4c` (Ubuntu real-extension), `.artifacts/platform-smoke/run-1780938585007-l0xapp` (Windows native platform-build), `.artifacts/platform-smoke/run-1780938820527-c1j8tt` (Windows native real-extension)
+- Pi 0.79.0 isolated local-extension model-agent smoke: `.artifacts/real-smoke/run-1780935835596-pfbn5o` passed with `PI_ORACLE_REAL_TEST_MODEL_AGENT=1 npm run smoke:real:source`
+- Pi 0.79.0 packed-install smoke: `.artifacts/real-smoke/run-1780935825537-pmna07` passed with `npm run smoke:real:packed`
 - expired-auth drill fail path: `a2460bc1-7d89-4041-b67d-39680d310325`
 - `/oracle-auth` repair evidence: the per-run `/tmp/pi-oracle-auth-*/oracle-auth.log` bundle path printed by `/oracle-auth`
 - expired-auth drill post-repair success: `fa26a2a7-0057-4a21-b3e0-71c1d020facf`
 - successful multi-artifact completion: `b6b3599c-6b91-4315-adfa-8a83aa5eda9b`
 - repo-owned sanity harness: `npm run sanity:oracle`
+- real installed-extension smoke source of truth: `scripts/oracle-real-smoke.mjs`; required release proof runs packed-install mode (`npm run smoke:real:packed`), asserts Pi 0.80.9, and executes `/oracle-status` through Pi's installed-package loader without provider credentials or an external oracle job; optional slower model-agent submission debugging remains behind `PI_ORACLE_REAL_TEST_MODEL_AGENT=1`; source mode (`npm run smoke:real:source`) is inner-loop/debug only
+- macOS, Ubuntu, and Windows native package/build/runtime smoke source of truth: `docs/platform-smoke.md`; use `npm run verify:oracle` for everyday local iteration, `npm run smoke:platform:doctor` plus a focused target/suite run for platform-sensitive changes, `npm run smoke:platform:all` for doctor-first platform matrix evidence, and `npm run release:check` for the full local-plus-platform release gate
+- release gate: `npm run release:check`, also used by `prepublishOnly`, combines static verification, fresh loaded-extension ChatGPT preset proof via `npm run release:proof:chatgpt-presets`, and all required Crabbox platform smokes

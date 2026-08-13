@@ -4,9 +4,11 @@
 // Usage: Imported by oracle commands, tools, queue logic, poller flows, and runtime cleanup/reconciliation paths.
 // Invariants/Assumptions: Job mutations happen under per-job locks, worker identity checks defend against PID reuse, and persisted jobs remain the source of truth.
 import { createHash, randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative as relativePath, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   ACTIVE_ORACLE_JOB_STATUSES,
@@ -28,6 +30,9 @@ import type { OracleJobLifecycleEvent as SharedOracleJobLifecycleEvent, OracleJo
 import { hasDurableWorkerHandoff as sharedHasDurableWorkerHandoff } from "../shared/job-coordination-helpers.mjs";
 import { isTrackedProcessAlive, readProcessStartedAt, spawnDetachedNodeProcess, terminateTrackedProcess } from "../shared/process-helpers.mjs";
 import type { OracleConfig, OracleResolvedSelection } from "./config.js";
+import { getOracleJobsDir } from "../shared/state-path-helpers.mjs";
+import { parseTimestamp } from "../shared/time-helpers.mjs";
+import { resolveOracleProviderArchivePlan } from "./provider-capabilities.js";
 import { withJobLock, withLock } from "./locks.js";
 import { cleanupRuntimeArtifacts, getProjectId, getSessionId, parseConversationId, requirePersistedSessionFile, type OracleCleanupReport } from "./runtime.js";
 
@@ -47,9 +52,8 @@ const ORACLE_JOB_DIR_RM_MAX_RETRIES = 5;
 const ORACLE_JOB_DIR_RM_RETRY_DELAY_MS = 50;
 const ORACLE_COMPLETE_JOB_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
 const ORACLE_FAILED_JOB_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
-export const DEFAULT_ORACLE_JOBS_DIR = "/tmp";
-export const ORACLE_JOBS_DIR_ENV = "PI_ORACLE_JOBS_DIR";
-const ORACLE_JOBS_DIR = process.env[ORACLE_JOBS_DIR_ENV]?.trim() || DEFAULT_ORACLE_JOBS_DIR;
+export { DEFAULT_ORACLE_JOBS_DIR, ORACLE_JOBS_DIR_ENV, getOracleJobsDir } from "../shared/state-path-helpers.mjs";
+const ORACLE_JOBS_DIR = getOracleJobsDir();
 
 export function isActiveOracleJob(job: Pick<OracleJob, "status">): boolean {
   return ACTIVE_ORACLE_JOB_STATUSES.includes(job.status);
@@ -116,6 +120,14 @@ export interface OracleArtifactRecord {
   matchesUploadedArchive?: boolean;
 }
 
+export interface OracleExtensionProvenance {
+  schemaVersion: 1;
+  packageName: string;
+  packageVersion: string;
+  sourcePath: string;
+  gitHead?: string;
+}
+
 export interface OracleJob {
   id: string;
   status: OracleJobStatus;
@@ -134,6 +146,7 @@ export interface OracleJob {
   originSessionFile?: string;
   requestSource: "command" | "tool";
   selection: OracleResolvedSelection;
+  extensionProvenance?: OracleExtensionProvenance;
   followUpToJobId?: string;
   chatUrl?: string;
   conversationId?: string;
@@ -197,13 +210,12 @@ export interface OracleRuntimeAllocation {
   seedGeneration?: string;
 }
 
-export function getSessionFile(ctx: ExtensionContext): string | undefined {
-  const manager = ctx.sessionManager as unknown as { getSessionFile?: () => string | undefined };
-  return manager.getSessionFile?.();
+function hasSessionFileAccessor(value: unknown): value is { getSessionFile: () => string | undefined } {
+  return typeof value === "object" && value !== null && "getSessionFile" in value && typeof value.getSessionFile === "function";
 }
 
-export function getOracleJobsDir(): string {
-  return ORACLE_JOBS_DIR;
+export function getSessionFile(ctx: ExtensionContext): string | undefined {
+  return hasSessionFileAccessor(ctx.sessionManager) ? ctx.sessionManager.getSessionFile() : undefined;
 }
 
 export function getJobDir(id: string): string {
@@ -280,12 +292,6 @@ export async function clearCleanupPending(jobId: string, at = new Date().toISOSt
   } catch {
     return readJob(jobId);
   }
-}
-
-function parseTimestamp(value: string | undefined): number | undefined {
-  if (!value) return undefined;
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 function notificationClaimIsOwnedBy(job: Pick<OracleJob, "notifyClaimedAt" | "notifyClaimedBy">, claimedBy: string, now = Date.now()): boolean {
@@ -448,8 +454,8 @@ export async function cleanupJobResources(
 
 function getCleanupRetentionMs(job: OracleJob): { complete: number; failed: number } {
   return {
-    complete: job.config.cleanup?.completeJobRetentionMs ?? ORACLE_COMPLETE_JOB_RETENTION_MS,
-    failed: job.config.cleanup?.failedJobRetentionMs ?? ORACLE_FAILED_JOB_RETENTION_MS,
+    complete: job.config?.cleanup?.completeJobRetentionMs ?? ORACLE_COMPLETE_JOB_RETENTION_MS,
+    failed: job.config?.cleanup?.failedJobRetentionMs ?? ORACLE_FAILED_JOB_RETENTION_MS,
   };
 }
 
@@ -895,6 +901,39 @@ export async function cancelOracleJob(id: string, reason = "Cancelled by user"):
   });
 }
 
+function readExtensionProvenance(cwd: string): OracleExtensionProvenance {
+  const sourcePath = resolve(fileURLToPath(new URL("../../../", import.meta.url)));
+  let packageName = "pi-oracle";
+  let packageVersion = "unknown";
+  try {
+    const packageJson = JSON.parse(readFileSync(join(sourcePath, "package.json"), "utf8")) as { name?: string; version?: string };
+    packageName = packageJson.name || packageName;
+    packageVersion = packageJson.version || packageVersion;
+  } catch {
+    // Keep provenance present even when package metadata is unavailable in an
+    // unusual loader; release proof rejects unknown versions.
+  }
+
+  let gitHead: string | undefined;
+  try {
+    gitHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: sourcePath, encoding: "utf8" }).trim();
+  } catch {
+    try {
+      gitHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).trim();
+    } catch {
+      gitHead = undefined;
+    }
+  }
+
+  return {
+    schemaVersion: 1,
+    packageName,
+    packageVersion,
+    sourcePath,
+    gitHead,
+  };
+}
+
 export async function createJob(
   id: string,
   input: OracleSubmitInput,
@@ -908,7 +947,7 @@ export async function createJob(
   const logsDir = join(jobDir, "logs");
   const workerLogPath = join(logsDir, "worker.log");
   const promptPath = join(jobDir, "prompt.md");
-  const archivePath = join(jobDir, `context-${id}.tar.zst`);
+  const archivePath = join(jobDir, `context-${id}.${resolveOracleProviderArchivePlan(input.selection.provider).archiveExtension}`);
   const responsePath = join(jobDir, "response.md");
   const reasoningPath = join(jobDir, "reasoning.md");
   const artifactsManifestPath = join(jobDir, "artifacts.json");
@@ -942,6 +981,7 @@ export async function createJob(
     originSessionFile: sessionFile,
     requestSource: input.requestSource,
     selection: input.selection,
+    extensionProvenance: readExtensionProvenance(cwd),
     followUpToJobId: input.followUpToJobId,
     chatUrl: input.chatUrl,
     conversationId,
@@ -989,13 +1029,14 @@ export function resolveArchiveInputs(cwd: string, files: string[]): { absolute: 
       throw new Error("Archive input must use '.' exactly for a whole-repo archive");
     }
     const absolute = resolve(cwd, file);
-    if (absolute === cwd && file !== ".") {
+    const relativeFromCwd = relativePath(cwd, absolute);
+    if (relativeFromCwd === "" && file !== ".") {
       throw new Error("Archive input must use '.' exactly for a whole-repo archive");
     }
-    const relative = absolute.startsWith(`${cwd}/`) ? absolute.slice(cwd.length + 1) : absolute === cwd ? "." : "";
-    if (!relative) {
+    if (relativeFromCwd && (relativeFromCwd === ".." || relativeFromCwd.startsWith(`..${sep}`) || isAbsolute(relativeFromCwd))) {
       throw new Error(`Archive input must be inside the project cwd: ${file}`);
     }
+    const relative = relativeFromCwd === "" ? "." : relativeFromCwd.split(sep).join("/");
     if (!existsSync(absolute)) {
       throw new Error(`Archive input does not exist: ${file}`);
     }

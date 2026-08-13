@@ -10,7 +10,7 @@ import { chmod, mkdir, readdir, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionManager, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type SessionEntry } from "@earendil-works/pi-coding-agent";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { AssistantMessage } from "@earendil-works/pi-ai/compat";
 import {
   resolveOracleSubmitPreset,
   type OracleConfig,
@@ -63,7 +63,8 @@ export async function waitForCondition<T>(
   evaluate: () => Promise<T | undefined | false> | T | undefined | false,
   options: { timeoutMs: number; intervalMs?: number; description: string },
 ): Promise<T> {
-  const deadline = Date.now() + options.timeoutMs;
+  const timeoutMs = process.platform === "win32" ? Math.max(options.timeoutMs, options.timeoutMs * 4) : options.timeoutMs;
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const result = await evaluate();
     if (result) return result;
@@ -299,11 +300,12 @@ export type PollerTestContext = ExtensionContext & {
   hasPendingMessages: () => boolean;
 };
 
-export function createPollerCtx(sessionManager: SessionManager, cwd = process.cwd()): PollerTestContext {
+export function createPollerCtx(sessionManager: SessionManager, cwd = process.cwd(), mode: ExtensionContext["mode"] = "tui"): PollerTestContext {
   return {
     cwd,
+    mode,
     sessionManager,
-    hasUI: true,
+    hasUI: mode === "tui" || mode === "rpc",
     ui: createUiStub(),
     isIdle: () => true,
     hasPendingMessages: () => false,
@@ -346,6 +348,7 @@ export interface PiHarness extends ExtensionAPI {
   commands: Map<string, CommandDefinitionLike>;
   handlers: Map<string, (event: unknown, ctx: ExtensionContext) => unknown>;
   sentMessages: SentMessageLike[];
+  sentUserMessages: Array<{ content: unknown; options?: unknown }>;
 }
 
 export function createPiHarness(): PiHarness {
@@ -353,11 +356,13 @@ export function createPiHarness(): PiHarness {
   const commands = new Map<string, CommandDefinitionLike>();
   const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
   const sentMessages: SentMessageLike[] = [];
+  const sentUserMessages: Array<{ content: unknown; options?: unknown }> = [];
   return {
     tools,
     commands,
     handlers,
     sentMessages,
+    sentUserMessages,
     registerTool(definition: ToolDefinitionLike) {
       tools.set(definition.name, definition);
     },
@@ -370,6 +375,9 @@ export function createPiHarness(): PiHarness {
     sendMessage(message: SentMessageLike) {
       sentMessages.push(message);
     },
+    sendUserMessage(content: unknown, options?: unknown) {
+      sentUserMessages.push({ content, options });
+    },
   } as unknown as PiHarness;
 }
 
@@ -377,10 +385,12 @@ export function createCommandCtx(
   sessionManager: ExtensionCommandContext["sessionManager"],
   ui = createUiStub(),
   cwd = process.cwd(),
+  mode: ExtensionCommandContext["mode"] = "tui",
 ): ExtensionCommandContext {
   return {
     cwd,
-    hasUI: true,
+    mode,
+    hasUI: mode === "tui" || mode === "rpc",
     sessionManager,
     ui,
   } as unknown as ExtensionCommandContext;
@@ -390,10 +400,12 @@ export function createExtensionCtx(
   sessionManager: ExtensionContext["sessionManager"],
   ui = createUiStub(),
   cwd = process.cwd(),
+  mode: ExtensionContext["mode"] = "tui",
 ): ExtensionContext {
   return {
     cwd,
-    hasUI: true,
+    mode,
+    hasUI: mode === "tui" || mode === "rpc",
     sessionManager,
     ui,
   } as unknown as ExtensionContext;

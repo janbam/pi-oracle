@@ -4,12 +4,14 @@
 // Usage: Imported by the oracle extension entrypoint and sanity tests to register tools against the pi API.
 // Invariants/Assumptions: The pi runtime validates TypeBox schemas before execute, while execute owns semantic normalization.
 import { randomUUID } from "node:crypto";
-import { lstat, mkdtemp, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { rename, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join, posix } from "node:path";
+import { join } from "node:path";
+import { createArchive, type ArchiveCreationResult, type ArchiveSizeBreakdownRow } from "./archive.js";
 import { runOracleAuthBootstrap } from "./auth.js";
+import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import { Type, type Static } from "typebox";
 import { formatOracleCancelOutcome, formatOracleJobSummary, formatOracleSubmitResponse } from "../shared/job-observability-helpers.mjs";
 import { getLatestOracleJobLifecycleEvent, getLatestOracleTerminalLifecycleEvent, transitionOracleJobPhase } from "../shared/job-lifecycle-helpers.mjs";
 import { isLockTimeoutError, withGlobalReconcileLock, withLock } from "./locks.js";
@@ -17,11 +19,13 @@ import {
   coerceOracleSubmitPresetId,
   GROK_MODES,
   loadOracleConfig,
+  normalizeOracleProvider,
   ORACLE_PROVIDERS,
   ORACLE_SUBMIT_PRESET_IDS,
   resolveOracleConfigForProvider,
   resolveOracleGrokMode,
   resolveOracleSubmitPreset,
+  type OracleConfig,
   type OracleGrokMode,
   type OracleProvider,
 } from "./config.js";
@@ -42,14 +46,15 @@ import {
   pruneTerminalOracleJobs,
   reconcileStaleOracleJobs,
   resolveArchiveInputs,
-  sha256File,
   shouldAdvanceQueueAfterCancellation,
   spawnWorker,
   terminateWorkerPid,
   updateJob,
   type OracleJob,
 } from "./jobs.js";
+import { isOracleProjectTrusted } from "./trust.js";
 import { getQueuePosition, promoteQueuedJobs, promoteQueuedJobsWithinAdmissionLock } from "./queue.js";
+import { resolveOracleProviderArchivePlan } from "./provider-capabilities.js";
 import { refreshOracleStatus } from "./poller.js";
 import {
   allocateRuntime,
@@ -64,21 +69,25 @@ import {
   tryAcquireRuntimeLease,
 } from "./runtime.js";
 
+const ORACLE_PROVIDER_PARAM_DESCRIPTION = `Oracle web provider. Omit to use the configured default provider. Supported providers: ${ORACLE_PROVIDERS.join(", ")}.`;
+const ORACLE_PROVIDER_PARAM = Type.Optional(StringEnum(ORACLE_PROVIDERS, {
+  description: ORACLE_PROVIDER_PARAM_DESCRIPTION,
+}));
+const ORACLE_GROK_MODE_PARAM = Type.Optional(StringEnum(GROK_MODES, {
+  description: "Provider mode. For Grok, 'expert' (free, default) or 'heavy' (paid). Omit to use the configured default mode.",
+}));
+
 const ORACLE_SUBMIT_PARAMS = Type.Object({
   prompt: Type.String({ description: "Prompt text to send to ChatGPT or Grok web." }),
   files: Type.Array(Type.String({
     description: "Project-relative file or directory path to include in the archive.",
     minLength: 1,
-    pattern: "^.*\\S.*$",
+    pattern: "^.*[^ \\t\\r\\n].*$",
   }), {
     description: "Exact project-relative files/directories to include in the oracle archive.",
     minItems: 1,
   }),
-  provider: Type.Optional(
-    Type.String({
-      description: `Oracle web provider. Omit to use the configured default provider. Supported providers: ${ORACLE_PROVIDERS.join(", ")}. Use grok when the user asks to oracle to Grok. Grok archives are capped at 200 MiB.`,
-    }),
-  ),
+  provider: ORACLE_PROVIDER_PARAM,
   preset: Type.Optional(
     Type.String({
       description:
@@ -86,486 +95,55 @@ const ORACLE_SUBMIT_PARAMS = Type.Object({
         "Matching human-readable preset labels and common hyphen/space variants are normalized automatically. Do not pass preset when provider is grok.",
     }),
   ),
-  mode: Type.Optional(
-    Type.String({
-      description: "Provider mode. For Grok, 'expert' (free, default) or 'heavy' (paid). Omit to use the configured default mode.",
-    }),
-  ),
+  mode: ORACLE_GROK_MODE_PARAM,
   followUpJobId: Type.Optional(Type.String({ description: "Earlier oracle job id whose chat thread should be continued." })),
-});
+  chatGptConversationId: Type.Optional(Type.String({
+    description: "Existing ChatGPT conversation id, or full https://chatgpt.com/c/... URL, to continue. Omit for default behavior: starting a fresh oracle thread. Do not combine with followUpJobId.",
+    minLength: 1,
+    pattern: "^.*[^ \\t\\r\\n].*$",
+  })),
+}, { additionalProperties: false });
 
 const ORACLE_PREFLIGHT_PARAMS = Type.Object({
-  provider: Type.Optional(Type.String({ description: `Provider readiness to check. Omit to use the configured default provider. Supported providers: ${ORACLE_PROVIDERS.join(", ")}.` })),
+  provider: ORACLE_PROVIDER_PARAM,
   followUpJobId: Type.Optional(Type.String({ description: "Earlier oracle job id whose provider/thread readiness should be checked." })),
-});
+  chatGptConversationId: Type.Optional(Type.String({
+    description: "Existing ChatGPT conversation id, or full https://chatgpt.com/c/... URL, whose provider/thread readiness should be checked. Do not combine with followUpJobId.",
+    minLength: 1,
+    pattern: "^.*[^ \\t\\r\\n].*$",
+  })),
+}, { additionalProperties: false });
 
 const ORACLE_AUTH_PARAMS = Type.Object({
-  provider: Type.Optional(Type.String({ description: `Provider auth seed to refresh. Omit to use the configured default provider. Supported providers: ${ORACLE_PROVIDERS.join(", ")}.` })),
-});
+  provider: ORACLE_PROVIDER_PARAM,
+}, { additionalProperties: false });
 
 const ORACLE_READ_PARAMS = Type.Object({
   jobId: Type.String({ description: "Oracle job id." }),
-});
+}, { additionalProperties: false });
 
 const ORACLE_CANCEL_PARAMS = Type.Object({
   jobId: Type.String({ description: "Oracle job id." }),
-});
+}, { additionalProperties: false });
 
-const CHATGPT_MAX_ARCHIVE_BYTES = 250 * 1024 * 1024;
-const GROK_MAX_ARCHIVE_BYTES = 200 * 1024 * 1024;
-const MAX_ARCHIVE_BYTES = CHATGPT_MAX_ARCHIVE_BYTES;
 const MAX_QUEUED_JOBS_PER_ACTIVE_RUNTIME = 1;
-const MAX_QUEUED_ARCHIVE_BYTES_PER_ACTIVE_RUNTIME = MAX_ARCHIVE_BYTES;
-const ARCHIVE_COMMAND_TIMEOUT_MS = 120_000;
-const ARCHIVE_COMMAND_KILL_GRACE_MS = 2_000;
-const ARCHIVE_PIPE_FAILURE_ERROR_CODES = new Set(["EPIPE", "ERR_STREAM_DESTROYED"]);
-
-const DEFAULT_ARCHIVE_EXCLUDED_DIR_NAMES_ANYWHERE = new Set([
-  ".git",
-  ".hg",
-  ".svn",
-  ".pi",
-  ".oracle-context",
-  ".cursor",
-  "node_modules",
-  "target",
-  ".venv",
-  "venv",
-  "__pycache__",
-  ".pytest_cache",
-  ".mypy_cache",
-  ".ruff_cache",
-  ".tox",
-  ".nox",
-  ".hypothesis",
-  ".next",
-  ".nuxt",
-  ".svelte-kit",
-  ".turbo",
-  ".parcel-cache",
-  ".cache",
-  ".gradle",
-  ".terraform",
-  "DerivedData",
-  ".build",
-  ".pnpm-store",
-  ".serverless",
-  ".aws-sam",
-  "secrets",
-  ".secrets",
-]);
-const DEFAULT_ARCHIVE_EXCLUDED_DIR_NAMES_AT_REPO_ROOT = new Set(["coverage", "htmlcov", "tmp", "temp", ".tmp", "dist", "build", "out"]);
-const DEFAULT_ARCHIVE_EXCLUDED_FILES = new Set([
-  ".coverage",
-  ".DS_Store",
-  ".env",
-  ".netrc",
-  ".npmrc",
-  ".pypirc",
-  ".scratchpad.md",
-  "Thumbs.db",
-  "id_dsa",
-  "id_ecdsa",
-  "id_ed25519",
-  "id_rsa",
-]);
-const DEFAULT_ARCHIVE_EXCLUDED_SUFFIXES = [".db", ".key", ".p12", ".pfx", ".pyc", ".pyd", ".pyo", ".pem", ".sqlite", ".sqlite3", ".tsbuildinfo", ".tfstate"];
-const DEFAULT_ARCHIVE_EXCLUDED_SUBSTRINGS = [".tfstate."];
-const DEFAULT_ARCHIVE_EXCLUDED_ENV_ALLOWLIST = new Set([".env.dist", ".env.example", ".env.sample", ".env.template"]);
-const DEFAULT_ARCHIVE_EXCLUDED_PATH_SEQUENCES = [[".yarn", "cache"]] as const;
-const ADAPTIVE_ARCHIVE_PRUNE_DIR_NAMES_ANYWHERE = new Set(["build", "dist", "out", "coverage", "htmlcov", "tmp", "temp", ".tmp"]);
-const ADAPTIVE_ARCHIVE_PRUNE_PROTECTED_ANCESTOR_DIR_NAMES = new Set(["src", "source", "sources", "lib"]);
-
-type ArchiveSizeBreakdownRow = { relativePath: string; bytes: number };
-type ArchiveCreationResult = {
-  sha256: string;
-  archiveBytes: number;
-  initialArchiveBytes?: number;
-  autoPrunedPrefixes: ArchiveSizeBreakdownRow[];
-  includedEntries: string[];
-};
-
-function appendArchiveEntries(target: string[], source: Iterable<string>): void {
-  for (const entry of source) target.push(entry);
+const MAX_QUEUED_ARCHIVE_BYTES_PER_ACTIVE_RUNTIME = resolveOracleProviderArchivePlan("chatgpt").maxArchiveBytes;
+function prepareOracleProviderAliases<T>(args: unknown, toolName: string): T {
+  const record = asRecord(args);
+  if (!record) return args as T;
+  return {
+    ...record,
+    provider: typeof record.provider === "string" ? normalizeOracleProvider(record.provider, "chatgpt", toolName) : record.provider,
+  } as T;
 }
 
-function getErrorCode(error: unknown): string | undefined {
-  return error && typeof error === "object" && "code" in error && typeof error.code === "string"
-    ? error.code
-    : undefined;
-}
-
-function mergeArchiveEntryGroups(groups: Iterable<Iterable<string>>): string[] {
-  const merged: string[] = [];
-  for (const group of groups) appendArchiveEntries(merged, group);
-  return merged;
-}
-
-export function mergeArchiveEntryGroupsForTesting(groups: Iterable<Iterable<string>>): string[] {
-  return mergeArchiveEntryGroups(groups);
-}
-
-function pathContainsSequence(relativePath: string, sequence: readonly string[]): boolean {
-  const segments = relativePath.split("/").filter(Boolean);
-  if (sequence.length === 0 || segments.length < sequence.length) return false;
-  for (let index = 0; index <= segments.length - sequence.length; index += 1) {
-    if (sequence.every((segment, offset) => segments[index + offset] === segment)) return true;
-  }
-  return false;
-}
-
-function getRelativeDepth(relativePath: string): number {
-  return relativePath.split("/").filter(Boolean).length;
-}
-
-function formatBytes(bytes: number): string {
-  return `${(bytes / (1024 * 1024)).toFixed(2)} MiB`;
-}
-
-function formatDirectoryLabel(relativePath: string): string {
-  return relativePath.endsWith("/") ? relativePath : `${relativePath}/`;
-}
-
-function summarizeByKey(
-  entrySizes: ArchiveSizeBreakdownRow[],
-  keyForEntry: (relativePath: string) => string | undefined,
-  limit = 7,
-): ArchiveSizeBreakdownRow[] {
-  const totals = new Map<string, number>();
-  for (const entry of entrySizes) {
-    const key = keyForEntry(entry.relativePath);
-    if (!key) continue;
-    totals.set(key, (totals.get(key) ?? 0) + entry.bytes);
-  }
-  return [...totals.entries()]
-    .map(([relativePath, bytes]) => ({ relativePath, bytes }))
-    .sort((left, right) => right.bytes - left.bytes || left.relativePath.localeCompare(right.relativePath))
-    .slice(0, limit);
-}
-
-function summarizeTopLevelIncludedPaths(entrySizes: ArchiveSizeBreakdownRow[]): ArchiveSizeBreakdownRow[] {
-  return summarizeByKey(entrySizes, (relativePath) => {
-    const [topLevel, ...rest] = relativePath.split("/").filter(Boolean);
-    if (!topLevel) return undefined;
-    return rest.length > 0 ? `${topLevel}/` : topLevel;
-  });
-}
-
-function getAdaptivePrunePrefix(relativePath: string): string | undefined {
-  const segments = relativePath.split("/").filter(Boolean);
-  for (let index = 0; index < segments.length - 1; index += 1) {
-    const name = segments[index];
-    if (!ADAPTIVE_ARCHIVE_PRUNE_DIR_NAMES_ANYWHERE.has(name)) continue;
-    const ancestors = segments.slice(0, index);
-    if (ancestors.some((segment) => ADAPTIVE_ARCHIVE_PRUNE_PROTECTED_ANCESTOR_DIR_NAMES.has(segment))) continue;
-    return segments.slice(0, index + 1).join("/");
-  }
-  return undefined;
-}
-
-function summarizeAdaptivePruneCandidates(
-  entrySizes: ArchiveSizeBreakdownRow[],
-  minimumBytes = 0,
-): ArchiveSizeBreakdownRow[] {
-  return summarizeByKey(entrySizes, getAdaptivePrunePrefix, Number.POSITIVE_INFINITY).filter((entry) => entry.bytes >= minimumBytes);
-}
-
-function pruneEntriesByPrefix(entries: string[], prefix: string): string[] {
-  return entries.filter((entry) => entry !== prefix && !entry.startsWith(`${prefix}/`));
-}
-
-function shouldExcludeArchivePath(relativePath: string, isDirectory: boolean, options?: { forceInclude?: boolean }): boolean {
-  const normalized = posix.normalize(relativePath).replace(/^\.\//, "");
-  if (!normalized || normalized === ".") return false;
-  if (options?.forceInclude) return false;
-  const name = basename(normalized);
-  if (DEFAULT_ARCHIVE_EXCLUDED_PATH_SEQUENCES.some((sequence) => pathContainsSequence(normalized, sequence))) return true;
-  if (isDirectory) {
-    if (DEFAULT_ARCHIVE_EXCLUDED_DIR_NAMES_ANYWHERE.has(name)) return true;
-    if (getRelativeDepth(normalized) === 1 && DEFAULT_ARCHIVE_EXCLUDED_DIR_NAMES_AT_REPO_ROOT.has(name)) return true;
-    return false;
-  }
-  if (DEFAULT_ARCHIVE_EXCLUDED_FILES.has(name)) return true;
-  if (name.startsWith(".env.") && !DEFAULT_ARCHIVE_EXCLUDED_ENV_ALLOWLIST.has(name)) return true;
-  if (DEFAULT_ARCHIVE_EXCLUDED_SUFFIXES.some((suffix) => name.endsWith(suffix))) return true;
-  if (DEFAULT_ARCHIVE_EXCLUDED_SUBSTRINGS.some((needle) => name.includes(needle))) return true;
-  return false;
-}
-
-async function isSymlinkToDirectory(path: string): Promise<boolean> {
-  try {
-    return (await stat(path)).isDirectory();
-  } catch {
-    return false;
-  }
-}
-
-async function shouldExcludeArchiveChild(
-  absolutePath: string,
-  relativePath: string,
-  child: { isDirectory(): boolean; isSymbolicLink(): boolean },
-  options?: { forceInclude?: boolean },
-): Promise<boolean> {
-  const isDirectoryLike = child.isDirectory() || (child.isSymbolicLink() && await isSymlinkToDirectory(absolutePath));
-  return shouldExcludeArchivePath(relativePath, isDirectoryLike, options);
-}
-
-async function expandArchiveEntries(cwd: string, relativePath: string, options?: { forceIncludeSubtree?: boolean }): Promise<string[]> {
-  const normalized = posix.normalize(relativePath).replace(/^\.\//, "");
-  if (normalized === ".") {
-    const children = await readdir(cwd, { withFileTypes: true });
-    const results: string[] = [];
-    for (const child of children.sort((a, b) => a.name.localeCompare(b.name))) {
-      const childRelative = child.name;
-      if (await shouldExcludeArchiveChild(join(cwd, childRelative), childRelative, child)) continue;
-      if (child.isDirectory()) appendArchiveEntries(results, await expandArchiveEntries(cwd, childRelative));
-      else results.push(childRelative);
-    }
-    return results;
-  }
-
-  const absolute = join(cwd, normalized);
-  const entry = await lstat(absolute);
-  if (!entry.isDirectory()) return [normalized];
-  if (shouldExcludeArchivePath(normalized, true, { forceInclude: options?.forceIncludeSubtree })) return [];
-
-  const children = await readdir(absolute, { withFileTypes: true });
-  const results: string[] = [];
-  for (const child of children.sort((a, b) => a.name.localeCompare(b.name))) {
-    const childRelative = posix.join(normalized, child.name);
-    if (await shouldExcludeArchiveChild(join(cwd, childRelative), childRelative, child, { forceInclude: options?.forceIncludeSubtree })) continue;
-    if (child.isDirectory()) appendArchiveEntries(results, await expandArchiveEntries(cwd, childRelative, { forceIncludeSubtree: options?.forceIncludeSubtree }));
-    else results.push(childRelative);
-  }
-  return results;
-}
-
-async function resolveExpandedArchiveEntriesFromInputs(
-  cwd: string,
-  entries: Array<{ absolute: string; relative: string }>,
-): Promise<string[]> {
-  const expandedGroups = await Promise.all(entries.map(async (entry) => {
-    const statEntry = await lstat(entry.absolute);
-    const forceIncludeSubtree = statEntry.isDirectory() && entry.relative !== "." && shouldExcludeArchivePath(entry.relative, true);
-    return expandArchiveEntries(cwd, entry.relative, { forceIncludeSubtree });
-  }));
-  return Array.from(new Set(mergeArchiveEntryGroups(expandedGroups))).sort();
-}
-
-export async function resolveExpandedArchiveEntries(cwd: string, files: string[]): Promise<string[]> {
-  return resolveExpandedArchiveEntriesFromInputs(cwd, resolveArchiveInputs(cwd, files));
-}
-
-function isWholeRepoArchiveSelection(entries: Array<{ absolute: string; relative: string }>): boolean {
-  return entries.length === 1 && entries[0]?.relative === ".";
-}
-
-async function measureArchiveEntrySizes(cwd: string, entries: string[]): Promise<ArchiveSizeBreakdownRow[]> {
-  return Promise.all(entries.map(async (relativePath) => ({ relativePath, bytes: (await lstat(join(cwd, relativePath))).size })));
-}
-
-function formatArchiveOversizeError(args: {
-  archiveBytes: number;
-  maxBytes: number;
-  entrySizes: ArchiveSizeBreakdownRow[];
-  autoPrunedPrefixes: ArchiveSizeBreakdownRow[];
-  adaptivePruneMinBytes?: number;
-}): string {
-  const topLevel = summarizeTopLevelIncludedPaths(args.entrySizes);
-  const adaptiveCandidates = summarizeAdaptivePruneCandidates(args.entrySizes, args.adaptivePruneMinBytes).slice(0, 7);
-  return [
-    `Oracle archive exceeds provider upload limit (${formatBytes(args.maxBytes)}) after default exclusions${args.autoPrunedPrefixes.length > 0 ? " and automatic generic generated-output-dir pruning" : ""}.`,
-    `The local archive measured ${formatBytes(args.archiveBytes)} (${args.archiveBytes} bytes), so submission stopped before dispatch.`,
-    args.autoPrunedPrefixes.length > 0 ? "Automatically pruned generic generated-output paths before failing:" : undefined,
-    ...args.autoPrunedPrefixes.map((entry) => `- ${formatDirectoryLabel(entry.relativePath)} — ${formatBytes(entry.bytes)}`),
-    topLevel.length > 0 ? "Approx top-level included sizes:" : undefined,
-    ...topLevel.map((entry) => `- ${entry.relativePath} — ${formatBytes(entry.bytes)}`),
-    adaptiveCandidates.length > 0 ? "Largest remaining generic generated-output-dir candidates:" : undefined,
-    ...adaptiveCandidates.map((entry) => `- ${formatDirectoryLabel(entry.relativePath)} — ${formatBytes(entry.bytes)}`),
-    "Recommended retry order: (1) remove the largest obviously irrelevant/generated/history/export content, (2) if it still does not fit, keep only the directly relevant subtrees plus adjacent docs/tests/config, (3) if it still does not fit, explain what was cut before asking the user.",
-  ]
-    .filter(Boolean)
-    .join("\n");
-}
-
-async function writeArchiveFile(
-  cwd: string,
-  entries: string[],
-  archivePath: string,
-  listPath: string,
-  options?: { commandTimeoutMs?: number },
-): Promise<number> {
-  await writeFile(listPath, Buffer.from(`${entries.join("\0")}\0`), { mode: 0o600 });
-  await rm(archivePath, { force: true }).catch(() => undefined);
-
-  const { spawn } = await import("node:child_process");
-  await new Promise<void>((resolvePromise, rejectPromise) => {
-    const tar = spawn("tar", ["--null", "-cf", "-", "-T", listPath], {
-      cwd,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    const zstd = spawn("zstd", ["-19", "-T0", "-f", "-o", archivePath], {
-      stdio: ["pipe", "ignore", "pipe"],
-    });
-
-    let stderr = "";
-    let settled = false;
-    let timedOut = false;
-    let timeout: NodeJS.Timeout | undefined;
-    let killGraceTimer: NodeJS.Timeout | undefined;
-    let tarCode: number | null | undefined;
-    let zstdCode: number | null | undefined;
-
-    const clearTimers = () => {
-      if (timeout) clearTimeout(timeout);
-      if (killGraceTimer) clearTimeout(killGraceTimer);
-    };
-
-    const terminateChildren = () => {
-      tar.kill("SIGTERM");
-      zstd.kill("SIGTERM");
-      killGraceTimer = setTimeout(() => {
-        tar.kill("SIGKILL");
-        zstd.kill("SIGKILL");
-      }, ARCHIVE_COMMAND_KILL_GRACE_MS);
-      killGraceTimer.unref?.();
-    };
-
-    const finish = (error?: Error) => {
-      if (settled) return;
-      if (error) {
-        settled = true;
-        clearTimers();
-        terminateChildren();
-        rejectPromise(error);
-        return;
-      }
-      if (tarCode === undefined || zstdCode === undefined) return;
-      settled = true;
-      clearTimers();
-      if (timedOut) {
-        rejectPromise(new Error(stderr || `Oracle archive subprocess timed out after ${options?.commandTimeoutMs ?? ARCHIVE_COMMAND_TIMEOUT_MS}ms`));
-        return;
-      }
-      if (tarCode === 0 && zstdCode === 0) resolvePromise();
-      else rejectPromise(new Error(stderr || `archive command failed (tar=${tarCode}, zstd=${zstdCode})`));
-    };
-
-    const handlePipeError = (error: unknown) => {
-      const normalized = error instanceof Error ? error : new Error(String(error));
-      if (ARCHIVE_PIPE_FAILURE_ERROR_CODES.has(getErrorCode(normalized) ?? "")) {
-        stderr = `${stderr}${stderr ? "\n" : ""}${normalized.message}`;
-        tar.stdout.unpipe(zstd.stdin);
-        terminateChildren();
-        finish();
-        return;
-      }
-      finish(normalized);
-    };
-
-    const commandTimeoutMs = options?.commandTimeoutMs ?? ARCHIVE_COMMAND_TIMEOUT_MS;
-    if (commandTimeoutMs > 0) {
-      timeout = setTimeout(() => {
-        timedOut = true;
-        stderr = `${stderr}${stderr ? "\n" : ""}Oracle archive subprocess timed out after ${commandTimeoutMs}ms`;
-        terminateChildren();
-      }, commandTimeoutMs);
-      timeout.unref?.();
-    }
-
-    tar.stderr.on("data", (data) => {
-      stderr += String(data);
-    });
-    zstd.stderr.on("data", (data) => {
-      stderr += String(data);
-    });
-    tar.on("error", (error) => finish(error instanceof Error ? error : new Error(String(error))));
-    zstd.on("error", (error) => finish(error instanceof Error ? error : new Error(String(error))));
-    tar.stdout.on("error", handlePipeError);
-    zstd.stdin.on("error", handlePipeError);
-    tar.on("close", (code) => {
-      tarCode = code;
-      finish();
-    });
-    zstd.on("close", (code) => {
-      zstdCode = code;
-      finish();
-    });
-    tar.stdout.pipe(zstd.stdin);
-  });
-
-  return (await stat(archivePath)).size;
-}
-
-export async function createArchiveForTesting(
-  cwd: string,
-  files: string[],
-  archivePath: string,
-  options?: { maxBytes?: number; adaptivePruneMinBytes?: number; commandTimeoutMs?: number },
-): Promise<ArchiveCreationResult> {
-  const archiveInputs = resolveArchiveInputs(cwd, files);
-  const wholeRepoSelection = isWholeRepoArchiveSelection(archiveInputs);
-  let expandedEntries = await resolveExpandedArchiveEntriesFromInputs(cwd, archiveInputs);
-  if (expandedEntries.length === 0) {
-    throw new Error("Oracle archive inputs are empty after default exclusions");
-  }
-
-  const listDir = await mkdtemp(join(tmpdir(), "oracle-filelist-"));
-  const listPath = join(listDir, "files.list");
-  const maxBytes = options?.maxBytes ?? MAX_ARCHIVE_BYTES;
-  const adaptivePruneMinBytes = options?.adaptivePruneMinBytes ?? 0;
-  const autoPrunedPrefixes: ArchiveSizeBreakdownRow[] = [];
-  let initialArchiveBytes: number | undefined;
-
-  try {
-    while (true) {
-      if (expandedEntries.length === 0) {
-        throw new Error("Oracle archive inputs are empty after default exclusions and automatic size pruning");
-      }
-
-      const archiveBytes = await writeArchiveFile(cwd, expandedEntries, archivePath, listPath, { commandTimeoutMs: options?.commandTimeoutMs });
-      if (archiveBytes <= maxBytes) {
-        return {
-          sha256: await sha256File(archivePath),
-          archiveBytes,
-          initialArchiveBytes,
-          autoPrunedPrefixes,
-          includedEntries: [...expandedEntries],
-        };
-      }
-
-      if (initialArchiveBytes === undefined) initialArchiveBytes = archiveBytes;
-      const entrySizes = await measureArchiveEntrySizes(cwd, expandedEntries);
-      if (!wholeRepoSelection) {
-        throw new Error(formatArchiveOversizeError({ archiveBytes, maxBytes, entrySizes, autoPrunedPrefixes, adaptivePruneMinBytes }));
-      }
-
-      const nextCandidate = summarizeAdaptivePruneCandidates(entrySizes, adaptivePruneMinBytes).find(
-        (entry) => !autoPrunedPrefixes.some((pruned) => pruned.relativePath === entry.relativePath),
-      );
-      if (!nextCandidate) {
-        throw new Error(formatArchiveOversizeError({ archiveBytes, maxBytes, entrySizes, autoPrunedPrefixes, adaptivePruneMinBytes }));
-      }
-
-      autoPrunedPrefixes.push(nextCandidate);
-      expandedEntries = pruneEntriesByPrefix(expandedEntries, nextCandidate.relativePath);
-    }
-  } finally {
-    await rm(listDir, { recursive: true, force: true }).catch(() => undefined);
-  }
-}
-
-async function createArchive(cwd: string, files: string[], archivePath: string, maxBytes = MAX_ARCHIVE_BYTES): Promise<ArchiveCreationResult> {
-  return createArchiveForTesting(cwd, files, archivePath, { maxBytes });
-}
-
-function normalizeOracleProvider(value: unknown, fallback: OracleProvider, toolName = "oracle_submit"): OracleProvider {
-  if (value === undefined) return fallback;
-  if (typeof value !== "string") throw new Error(`${toolName} provider must be a string`);
-  const normalized = value.trim().toLowerCase();
-  if (normalized === "chatgpt" || normalized === "chat-gpt" || normalized === "openai") return "chatgpt";
-  if (normalized === "grok" || normalized === "xai" || normalized === "x.ai") return "grok";
-  throw new Error(`Unknown ${toolName} provider: ${value}. Use chatgpt or grok.`);
+function prepareOracleSubmitArguments(args: unknown): Static<typeof ORACLE_SUBMIT_PARAMS> {
+  const record = asRecord(args);
+  if (!record) return args as Static<typeof ORACLE_SUBMIT_PARAMS>;
+  return {
+    ...prepareOracleProviderAliases<Record<string, unknown>>(record, "oracle_submit"),
+    mode: typeof record.mode === "string" ? normalizeGrokMode(record.mode, "heavy") : record.mode,
+  } as Static<typeof ORACLE_SUBMIT_PARAMS>;
 }
 
 function normalizeGrokMode(value: unknown, fallback: OracleGrokMode): OracleGrokMode {
@@ -577,10 +155,6 @@ function normalizeGrokMode(value: unknown, fallback: OracleGrokMode): OracleGrok
   if (normalized === "fast" || normalized === "grok fast" || normalized === "grok-fast") return "fast";
   if (normalized === "auto" || normalized === "grok auto" || normalized === "grok-auto") return "auto";
   throw new Error(`Unknown Grok oracle mode: ${value}. Use one of: ${GROK_MODES.join(", ")}.`);
-}
-
-function getProviderMaxArchiveBytes(provider: "chatgpt" | "grok"): number {
-  return provider === "grok" ? GROK_MAX_ARCHIVE_BYTES : CHATGPT_MAX_ARCHIVE_BYTES;
 }
 
 export interface QueuedArchivePressure {
@@ -637,12 +211,59 @@ export function getQueueAdmissionFailure(args: {
   return undefined;
 }
 
-function resolveFollowUp(previousJobId: string | undefined, cwd: string): {
+type OracleConversationTarget = {
   followUpToJobId?: string;
   chatUrl?: string;
   conversationId?: string;
   provider?: "chatgpt" | "grok";
-} {
+  label?: string;
+};
+
+const CHATGPT_CONVERSATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{7,}$/;
+const CHATGPT_CONVERSATION_URL_HOSTS = new Set(["chatgpt.com", "chat.openai.com"]);
+
+function chatGptConversationOrigin(config: Pick<OracleConfig, "browser">): string {
+  try {
+    const parsed = new URL(config.browser.chatUrl);
+    if (CHATGPT_CONVERSATION_URL_HOSTS.has(parsed.hostname.toLowerCase())) return parsed.origin;
+  } catch {
+    // Fall through to the canonical ChatGPT origin.
+  }
+  return "https://chatgpt.com";
+}
+
+export function resolveChatGptConversationReference(
+  rawReference: string | undefined,
+  config: Pick<OracleConfig, "browser">,
+): { chatUrl: string; conversationId: string } | undefined {
+  if (rawReference === undefined) return undefined;
+  const reference = rawReference.trim();
+  if (!reference) throw new Error("ChatGPT conversation id must be a non-empty string");
+
+  try {
+    const parsed = new URL(reference);
+    const host = parsed.hostname.toLowerCase();
+    const conversationId = parseConversationId(parsed.toString());
+    if (parsed.protocol !== "https:" || !CHATGPT_CONVERSATION_URL_HOSTS.has(host) || !conversationId) {
+      throw new Error();
+    }
+    return {
+      chatUrl: `${parsed.origin}/c/${conversationId}`,
+      conversationId,
+    };
+  } catch {
+    if (!CHATGPT_CONVERSATION_ID_PATTERN.test(reference)) {
+      throw new Error(`Invalid ChatGPT conversation id or URL: ${rawReference}`);
+    }
+    const origin = chatGptConversationOrigin(config);
+    return {
+      chatUrl: `${origin}/c/${reference}`,
+      conversationId: reference,
+    };
+  }
+}
+
+function resolveFollowUp(previousJobId: string | undefined, cwd: string): OracleConversationTarget {
   if (!previousJobId) return {};
   const previous = readJob(previousJobId);
   if (!previous) {
@@ -657,12 +278,35 @@ function resolveFollowUp(previousJobId: string | undefined, cwd: string): {
   if (!previous.chatUrl) {
     throw new Error(`Follow-up oracle job ${previousJobId} has no persisted chat URL`);
   }
+  const conversationId = previous.conversationId || parseConversationId(previous.chatUrl);
   return {
     followUpToJobId: previous.id,
     chatUrl: previous.chatUrl,
-    conversationId: previous.conversationId || parseConversationId(previous.chatUrl),
+    conversationId,
     provider: previous.selection?.provider === "grok" ? "grok" : "chatgpt",
+    label: `follow-up job ${previous.id}`,
   };
+}
+
+function resolveConversationTarget(args: {
+  followUpJobId?: string;
+  chatGptConversationId?: string;
+  cwd: string;
+  config: OracleConfig;
+}): OracleConversationTarget {
+  if (args.followUpJobId !== undefined && args.chatGptConversationId !== undefined) {
+    throw new Error("Pass either followUpJobId or chatGptConversationId, not both");
+  }
+  if (args.chatGptConversationId !== undefined) {
+    const target = resolveChatGptConversationReference(args.chatGptConversationId, args.config);
+    if (!target) return {};
+    return {
+      ...target,
+      provider: "chatgpt",
+      label: `ChatGPT conversation ${target.conversationId}`,
+    };
+  }
+  return resolveFollowUp(args.followUpJobId, args.cwd);
 }
 
 type OracleToolName = "oracle_auth" | "oracle_submit" | "oracle_read" | "oracle_cancel";
@@ -801,6 +445,15 @@ function buildOracleToolErrorDetails(toolName: OracleToolErrorSource, error: unk
     };
   }
 
+  if (message.startsWith("Oracle auth seed profile exists but is not authenticated: ")) {
+    return {
+      code: "auth_seed_profile_unauthenticated",
+      message,
+      rejectedValue: message.replace(/^Oracle auth seed profile exists but is not authenticated: /, "").replace(/\. Run \/oracle-auth.*$/, ""),
+      suggestedNextStep: "Call oracle_auth or run /oracle-auth once to create a verified auth seed, then retry the oracle tool call.",
+    };
+  }
+
   if (message.startsWith("Failed to parse oracle config ") || message.startsWith("Invalid oracle config:") || message.startsWith("Invalid oracle project config:")) {
     return {
       code: "oracle_config_invalid",
@@ -834,6 +487,14 @@ function buildOracleToolErrorDetails(toolName: OracleToolErrorSource, error: unk
       message,
       rejectedValue,
       suggestedNextStep: `Install ${rejectedValue || "the missing dependency"} and retry.`,
+    };
+  }
+
+  if (/^Oracle (auth seed profile|runtime profile|runtime profiles) path is unsafe: /.test(message)) {
+    return {
+      code: "oracle_profile_path_unsafe",
+      message,
+      suggestedNextStep: "Move browser.authSeedProfileDir/browser.runtimeProfilesDir outside real browser profile directories and retry.",
     };
   }
 
@@ -906,6 +567,23 @@ function buildOracleToolErrorDetails(toolName: OracleToolErrorSource, error: unk
     };
   }
 
+  if ((toolName === "oracle_submit" || toolName === "oracle_preflight") && message === "Pass either followUpJobId or chatGptConversationId, not both") {
+    return {
+      code: "oracle_thread_target_conflict",
+      message,
+      suggestedNextStep: "Retry with exactly one same-thread target: followUpJobId for an oracle-created thread, or chatGptConversationId for an existing ChatGPT browser thread.",
+    };
+  }
+
+  if ((toolName === "oracle_submit" || toolName === "oracle_preflight") && (message === "ChatGPT conversation id must be a non-empty string" || message.startsWith("Invalid ChatGPT conversation id or URL: "))) {
+    return {
+      code: "invalid_chatgpt_conversation_id",
+      message,
+      rejectedValue: typeof params.chatGptConversationId === "string" ? params.chatGptConversationId : undefined,
+      suggestedNextStep: "Retry with a ChatGPT conversation id like 6a28ab5c-e4d4-83e8-b8be-dd39f38a26d6 or a full https://chatgpt.com/c/... URL, or omit chatGptConversationId to start a fresh thread.",
+    };
+  }
+
   if (toolName === "oracle_submit" && message.startsWith("Follow-up oracle job not found: ")) {
     return {
       code: "follow_up_job_not_found",
@@ -969,10 +647,10 @@ function buildOracleToolErrorDetails(toolName: OracleToolErrorSource, error: unk
 function buildOracleToolErrorResult(
   toolName: OracleToolName,
   error: unknown,
-  params: Record<string, unknown>,
+  params: unknown,
   options?: { job?: NonNullable<ReturnType<typeof readJob>>; jobDetails?: OracleToolJobDetailsOptions },
 ) {
-  const errorDetails = buildOracleToolErrorDetails(toolName, error, params);
+  const errorDetails = buildOracleToolErrorDetails(toolName, error, asRecord(params) ?? {});
   return {
     content: [{
       type: "text" as const,
@@ -1016,10 +694,10 @@ function formatOraclePreflightResponse(details: OraclePreflightDetails): string 
   if (details.ready) {
     return [
       `Oracle preflight ready for ${providerLabel}.`,
-      details.session.sessionFile ? `Persisted session: ${details.session.sessionFile}` : undefined,
-      details.auth.seedProfileDir ? `Auth seed profile: ${details.auth.seedProfileDir}` : undefined,
+      details.session.sessionFile ? `Persisted pi session (current run): ${details.session.sessionFile}` : undefined,
+      details.auth.seedProfileDir ? `Auth seed profile (${providerLabel} login source): ${details.auth.seedProfileDir}` : undefined,
       `Preflight validates the persisted pi session, local oracle config, and ${providerLabel} auth seed created by oracle_auth.`,
-      "You can continue with oracle context gathering and submission.",
+      "If you are dispatching an oracle job, continue with context gathering and submission.",
     ].filter(Boolean).join("\n");
   }
 
@@ -1030,7 +708,7 @@ function formatOraclePreflightResponse(details: OraclePreflightDetails): string 
   ].filter(Boolean).join("\n");
 }
 
-async function runOraclePreflight(ctx: ExtensionContext, params: { provider?: unknown; followUpJobId?: unknown } = {}): Promise<OraclePreflightDetails> {
+async function runOraclePreflight(ctx: ExtensionContext, params: { provider?: unknown; followUpJobId?: unknown; chatGptConversationId?: unknown } = {}): Promise<OraclePreflightDetails> {
   const sessionFile = getSessionFile(ctx);
   if (!hasPersistedSessionFile(sessionFile)) {
     return {
@@ -1050,14 +728,18 @@ async function runOraclePreflight(ctx: ExtensionContext, params: { provider?: un
   let provider: OracleProvider | undefined;
   try {
     const followUpJobId = params.followUpJobId;
+    const chatGptConversationId = params.chatGptConversationId;
     if (followUpJobId !== undefined && typeof followUpJobId !== "string") {
       throw new Error("oracle_preflight followUpJobId must be a string");
     }
-    const baseConfig = loadOracleConfig(ctx.cwd);
-    const followUp = resolveFollowUp(followUpJobId, ctx.cwd);
-    provider = normalizeOracleProvider(params.provider, followUp.provider ?? baseConfig.defaults.provider, "oracle_preflight");
-    if (followUp.provider && provider !== followUp.provider) {
-      throw new Error(`Follow-up job ${followUpJobId} uses provider ${followUp.provider}; cannot check it with ${provider}.`);
+    if (chatGptConversationId !== undefined && typeof chatGptConversationId !== "string") {
+      throw new Error("oracle_preflight chatGptConversationId must be a string");
+    }
+    const baseConfig = loadOracleConfig(ctx.cwd, { projectConfigTrusted: isOracleProjectTrusted(ctx) });
+    const target = resolveConversationTarget({ followUpJobId, chatGptConversationId, cwd: ctx.cwd, config: baseConfig });
+    provider = normalizeOracleProvider(params.provider, target.provider ?? baseConfig.defaults.provider, "oracle_preflight");
+    if (target.provider && provider !== target.provider) {
+      throw new Error(`${target.label ?? "Oracle conversation"} requires provider ${target.provider}; cannot check it with ${provider}.`);
     }
     config = resolveOracleConfigForProvider(baseConfig, provider);
   } catch (error) {
@@ -1067,21 +749,21 @@ async function runOraclePreflight(ctx: ExtensionContext, params: { provider?: un
       session: { persisted: true, sessionFile },
       config: { ready: false },
       auth: { ready: false },
-      error: buildOracleToolErrorDetails("oracle_preflight", error, {}),
+      error: buildOracleToolErrorDetails("oracle_preflight", error, asRecord(params) ?? {}),
     };
   }
 
   try {
-    await assertOracleSubmitPrerequisites(config);
+    await assertOracleSubmitPrerequisites(config, provider);
   } catch (error) {
-    const errorDetails = buildOracleToolErrorDetails("oracle_preflight", error, {});
+    const errorDetails = buildOracleToolErrorDetails("oracle_preflight", error, asRecord(params) ?? {});
     return {
       ready: false,
       provider,
       session: { persisted: true, sessionFile },
       config: { ready: true },
       auth: {
-        ready: !["auth_seed_profile_missing", "auth_seed_profile_unreadable", "auth_seed_profile_invalid_type"].includes(errorDetails.code),
+        ready: !["auth_seed_profile_missing", "auth_seed_profile_unreadable", "auth_seed_profile_invalid_type", "auth_seed_profile_unauthenticated"].includes(errorDetails.code),
         seedProfileDir: config.browser.authSeedProfileDir,
       },
       error: errorDetails,
@@ -1117,9 +799,10 @@ export function registerOracleTools(pi: ExtensionAPI, workerPath: string, authWo
     description: "Check whether oracle is ready in this session before spending time gathering context or preparing a submission.",
     promptSnippet: "Check oracle readiness before expensive /oracle preparation.",
     promptGuidelines: [
-      "Call oracle_preflight before doing expensive /oracle preparation. Pass provider='grok' when the user explicitly asks for Grok, or followUpJobId for same-thread follow-ups. If ready is false, stop immediately and report the suggested next step instead of reading files or crafting archive inputs.",
+      "Call oracle_preflight before doing expensive /oracle preparation. Pass provider='grok' when the user explicitly asks for Grok, followUpJobId for same-thread follow-ups from oracle-created jobs, or chatGptConversationId when the user explicitly provides an existing ChatGPT browser conversation id/URL. If ready is false, stop immediately and report the suggested next step instead of reading files or crafting archive inputs.",
     ],
     parameters: ORACLE_PREFLIGHT_PARAMS,
+    prepareArguments: (args) => prepareOracleProviderAliases(args, "oracle_preflight"),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const details = await runOraclePreflight(ctx, params);
       return {
@@ -1140,12 +823,13 @@ export function registerOracleTools(pi: ExtensionAPI, workerPath: string, authWo
       "If oracle_auth itself fails, stop and report the failure instead of looping.",
     ],
     parameters: ORACLE_AUTH_PARAMS,
+    prepareArguments: (args) => prepareOracleProviderAliases(args, "oracle_auth"),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       try {
         const projectCwd = getProjectId(ctx.cwd);
-        const baseConfig = loadOracleConfig(projectCwd);
+        const baseConfig = loadOracleConfig(projectCwd, { projectConfigTrustCwd: ctx.cwd, projectConfigTrusted: isOracleProjectTrusted(ctx) });
         const provider = normalizeOracleProvider(params.provider, baseConfig.defaults.provider, "oracle_auth");
-        const message = await runOracleAuthBootstrap(authWorkerPath, projectCwd, provider);
+        const message = await runOracleAuthBootstrap(authWorkerPath, projectCwd, provider, { projectConfigTrustCwd: ctx.cwd, projectConfigTrusted: isOracleProjectTrusted(ctx) });
         return {
           content: [{ type: "text" as const, text: message }],
           details: {
@@ -1165,51 +849,51 @@ export function registerOracleTools(pi: ExtensionAPI, workerPath: string, authWo
     label: "Oracle Submit",
     description:
       "Dispatch a background ChatGPT or Grok web oracle job after gathering context. Always pass a prompt and exact project-relative archive inputs. " +
-      "Optional provider: set `provider` to `grok` when the user asks for Grok; Grok currently supports only Heavy. Optional ChatGPT model: set parameter `preset`, or omit it for configured defaults; canonical preset ids are listed in the README and ORACLE_SUBMIT_PRESETS registry, and matching labels are normalized at submit time.",
+      "Optional provider: set `provider` to `grok` when the user asks for Grok; Grok supports `expert` (free, default) or `heavy` (paid). Optional ChatGPT model: set parameter `preset`, or omit it for configured defaults; canonical preset ids are listed in the README and ORACLE_SUBMIT_PRESETS registry, and matching labels are normalized at submit time. " +
+      "Optional thread target: pass `chatGptConversationId` only when the user explicitly provides an existing ChatGPT browser conversation id/URL to continue; omit it for the default fresh oracle thread.",
     promptSnippet: "Dispatch a background ChatGPT or Grok web oracle job after gathering repo context.",
     promptGuidelines: [
-      "Gather context before calling oracle_submit.",
-      "If the immediately preceding oracle run failed because ChatGPT or Grok login is required or the worker explicitly said to rerun /oracle-auth, call oracle_auth once before retrying the submission; pass provider='grok' for Grok retries. Do not loop auth refreshes.",
-      "Prefer context-rich archives up to the provider ceiling because more relevant surrounding context is usually better than less: 250 MB for ChatGPT and 200 MiB for Grok.",
-      "By default, archive the whole repo by passing '.' for broad or unclear requests; default archive exclusions apply automatically, including common bulky outputs and obvious credentials/private data like .env files, key material, credential dotfiles, local database files, and nested secrets directories anywhere in the repo.",
-      "For narrower asks, still include nearby tests, docs, configs, and adjacent modules when they may improve answer quality. Only narrow aggressively when the user explicitly asks, privacy/sensitivity requires it, or size pressure forces it.",
-      "Do not default to a one-file archive for a single function, file, or stack trace if the relevant surrounding context still fits comfortably within the limit.",
-      "When files='.' and the post-exclusion archive is still too large, submit automatically prunes the largest nested directories matching generic generated-output names like build/, dist/, out/, coverage/, and tmp/ outside obvious source roots like src/ and lib/ until the archive fits or no candidate remains; successful submissions report what was pruned.",
-      "If a submitted oracle job later fails because upload is rejected, retry smaller: remove the largest obviously irrelevant/generated content first, then narrow to modified files plus adjacent files plus directly relevant subtrees, then explain the cut or ask the user if still needed.",
-      "If oracle_submit fails before dispatch with details.error.code === 'archive_too_large' or an upload-limit message, treat that as retryable and retry automatically with a smaller archive.",
-      "For archive_too_large retries, use the reported top-level size summary and any auto-pruned paths to decide what to cut: first remove the largest obviously irrelevant/generated/history/export content, then if needed narrow to the directly relevant subtrees plus adjacent docs/tests/config.",
-      "Do not loop forever: stop after at most two total oracle_submit attempts for the same request, and if it still does not fit explain what was cut and why.",
-      "For any other submit-time error, stop and report the error instead of retrying automatically.",
-      "If oracle_submit returns a queued job instead of an immediately dispatched one, treat that as success and stop exactly the same way.",
-      "After a successful or queued oracle_submit, stop; do not continue the task while the oracle job is running. If oracle_submit failed with retryable archive_too_large, narrow the archive and retry first.",
-      "For ChatGPT, use `preset` as the only model-selection parameter on oracle_submit. " +
-      `Canonical ids: ${ORACLE_SUBMIT_PRESET_IDS.join(", ")}. ` +
-      "matching human-readable preset labels are normalized automatically. Omit preset to use the configured default. For Grok, pass provider='grok' and omit preset; only Heavy is supported today.",
+      "Call oracle_preflight first, then gather enough context to choose archive inputs before oracle_submit.",
+      "Use context-rich archives when they fit; use files='.' for broad repo-wide asks. Default exclusions already skip common bulky outputs and obvious credentials/private data.",
+      "Pass chatGptConversationId only when the user explicitly provides an existing ChatGPT conversation id/URL; otherwise omit it for a fresh thread.",
+      "If auth is stale, call oracle_auth at most once before retrying. If oracle_auth fails, stop and report it.",
+      "If details.error.code is 'archive_too_large', retry once with a smaller archive using the reported size/pruning details; do not loop.",
+      "After a successful or queued oracle_submit, stop and report only the dispatch summary. Do not keep working while the oracle job runs.",
+      "For ChatGPT, use preset only when the user requests model control; otherwise omit it. For Grok, pass provider='grok' and omit preset.",
     ],
     parameters: ORACLE_SUBMIT_PARAMS,
+    prepareArguments: prepareOracleSubmitArguments,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       try {
         const projectCwd = getProjectId(ctx.cwd);
-        const baseConfig = loadOracleConfig(projectCwd);
+        const baseConfig = loadOracleConfig(projectCwd, { projectConfigTrustCwd: ctx.cwd, projectConfigTrusted: isOracleProjectTrusted(ctx) });
         const originSessionFile = requirePersistedSessionFile(getSessionFile(ctx), "submit oracle jobs");
         const projectId = getProjectId(projectCwd);
         const sessionId = getSessionId(originSessionFile, projectId);
-        const followUp = resolveFollowUp(params.followUpJobId, projectCwd);
-        const provider = normalizeOracleProvider(params.provider, followUp.provider ?? baseConfig.defaults.provider, "oracle_submit");
-        if (followUp.provider && provider !== followUp.provider) {
-          throw new Error(`Follow-up job ${params.followUpJobId} uses provider ${followUp.provider}; cannot continue it with ${provider}.`);
+        const target = resolveConversationTarget({
+          followUpJobId: params.followUpJobId,
+          chatGptConversationId: params.chatGptConversationId,
+          cwd: projectCwd,
+          config: baseConfig,
+        });
+        const provider = normalizeOracleProvider(params.provider, target.provider ?? baseConfig.defaults.provider, "oracle_submit");
+        if (target.provider && provider !== target.provider) {
+          throw new Error(`${target.label ?? "Oracle conversation"} requires provider ${target.provider}; cannot continue it with ${provider}.`);
         }
         if (provider === "grok" && typeof params.preset === "string") {
           throw new Error("oracle_submit preset is only valid for ChatGPT. For Grok, use provider='grok' and mode='expert' (or 'heavy' with SuperGrok subscription).");
+        }
+        if (provider === "chatgpt" && typeof params.mode === "string") {
+          throw new Error("oracle_submit mode is only valid for Grok. For ChatGPT, omit mode and use preset for model selection.");
         }
         const selection = provider === "grok"
           ? resolveOracleGrokMode(normalizeGrokMode(params.mode, baseConfig.defaults.grokMode))
           : resolveOracleSubmitPreset(typeof params.preset === "string" ? coerceOracleSubmitPresetId(params.preset) : baseConfig.defaults.preset);
         const config = resolveOracleConfigForProvider(baseConfig, provider);
-        const targetChatUrl = followUp.chatUrl;
+        const targetChatUrl = target.chatUrl;
         // Validate caller-specified archive paths before surfacing unrelated local setup failures such as a missing auth seed profile.
         resolveArchiveInputs(projectCwd, params.files);
-        await assertOracleSubmitPrerequisites(config);
+        await assertOracleSubmitPrerequisites(config, provider);
         try {
           await withGlobalReconcileLock({ processPid: process.pid, source: "oracle_submit", cwd: projectCwd }, async () => {
             await reconcileStaleOracleJobs();
@@ -1220,7 +904,8 @@ export function registerOracleTools(pi: ExtensionAPI, workerPath: string, authWo
         }
 
         const jobId = randomUUID();
-        const tempArchivePath = join(tmpdir(), `oracle-archive-${jobId}.tar.zst`);
+        const archivePlan = resolveOracleProviderArchivePlan(selection.provider);
+        const tempArchivePath = join(tmpdir(), `oracle-archive-${jobId}.${archivePlan.archiveExtension}`);
         const runtime = allocateRuntime(config);
         let job: OracleJob | undefined;
         let archive: ArchiveCreationResult | undefined;
@@ -1232,7 +917,7 @@ export function registerOracleTools(pi: ExtensionAPI, workerPath: string, authWo
         let spawnedWorker: Awaited<ReturnType<typeof spawnWorker>> | undefined;
 
         try {
-          archive = await createArchive(projectCwd, params.files, tempArchivePath, getProviderMaxArchiveBytes(selection.provider));
+          archive = await createArchive(projectCwd, params.files, tempArchivePath, archivePlan.maxArchiveBytes, archivePlan.archiveFormat);
           const currentArchive = archive;
           await withLock("admission", "global", { jobId, processPid: process.pid }, async () => {
             await promoteQueuedJobsWithinAdmissionLock({ workerPath, source: "oracle_submit" });
@@ -1271,7 +956,7 @@ export function registerOracleTools(pi: ExtensionAPI, workerPath: string, authWo
                   prompt: params.prompt,
                   files: params.files,
                   selection,
-                  followUpToJobId: followUp.followUpToJobId,
+                  followUpToJobId: target.followUpToJobId,
                   chatUrl: targetChatUrl,
                   requestSource: "tool",
                 },
@@ -1291,18 +976,18 @@ export function registerOracleTools(pi: ExtensionAPI, workerPath: string, authWo
             }
 
             runtimeLeaseAcquired = true;
-            if (followUp.conversationId) {
+            if (target.conversationId) {
               const conversationAttempt = await tryAcquireConversationLease({
                 jobId,
-                conversationId: followUp.conversationId,
+                conversationId: target.conversationId,
                 projectId,
                 sessionId,
                 createdAt: admittedAt,
               });
               if (!conversationAttempt.acquired) {
                 throw new Error(
-                  `Oracle conversation ${followUp.conversationId} is already in use by job ${conversationAttempt.blocker?.jobId ?? "unknown"}. ` +
-                    "Concurrent follow-ups to the same ChatGPT thread are not allowed.",
+                  `Oracle conversation ${target.conversationId} is already in use by job ${conversationAttempt.blocker?.jobId ?? "unknown"}. ` +
+                    "Concurrent jobs targeting the same ChatGPT thread are not allowed.",
                 );
               }
               conversationLeaseAcquired = true;
@@ -1314,7 +999,7 @@ export function registerOracleTools(pi: ExtensionAPI, workerPath: string, authWo
                 prompt: params.prompt,
                 files: params.files,
                 selection,
-                followUpToJobId: followUp.followUpToJobId,
+                followUpToJobId: target.followUpToJobId,
                 chatUrl: targetChatUrl,
                 requestSource: "tool",
               },
@@ -1429,13 +1114,13 @@ export function registerOracleTools(pi: ExtensionAPI, workerPath: string, authWo
             runtimeId: runtimeLeaseAcquired ? runtime.runtimeId : undefined,
             runtimeProfileDir: runtimeLeaseAcquired ? runtime.runtimeProfileDir : undefined,
             runtimeSessionName: workerSpawned ? runtime.runtimeSessionName : undefined,
-            conversationId: conversationLeaseAcquired ? followUp.conversationId : undefined,
+            conversationId: conversationLeaseAcquired ? target.conversationId : undefined,
           }).catch(() => ({ attempted: [], warnings: [] }));
           if (job && cleanupReport.warnings.length > 0) {
             await appendCleanupWarnings(job.id, cleanupReport.warnings).catch(() => undefined);
           }
           if (ctx.hasUI) refreshOracleStatus(ctx);
-          return buildOracleToolErrorResult("oracle_submit", error, params as unknown as Record<string, unknown>, {
+          return buildOracleToolErrorResult("oracle_submit", error, params, {
             job: latest ?? job,
             jobDetails: {
               queue: latest ? buildOracleQueueSnapshot(latest, latest.status === "queued" ? getQueuePosition(latest.id) : undefined) : undefined,
@@ -1448,7 +1133,7 @@ export function registerOracleTools(pi: ExtensionAPI, workerPath: string, authWo
           await rm(tempArchivePath, { force: true }).catch(() => undefined);
         }
       } catch (error) {
-        return buildOracleToolErrorResult("oracle_submit", error, params as unknown as Record<string, unknown>);
+        return buildOracleToolErrorResult("oracle_submit", error, params);
       }
     },
   });
@@ -1508,7 +1193,7 @@ export function registerOracleTools(pi: ExtensionAPI, workerPath: string, authWo
           },
         };
       } catch (error) {
-        return buildOracleToolErrorResult("oracle_read", error, params as unknown as Record<string, unknown>);
+        return buildOracleToolErrorResult("oracle_read", error, params);
       }
     },
   });
@@ -1543,7 +1228,7 @@ export function registerOracleTools(pi: ExtensionAPI, workerPath: string, authWo
           details: { job: redactJobDetails(cancelled, { queue: buildOracleQueueSnapshot(cancelled, cancelled.status === "queued" ? getQueuePosition(cancelled.id) : undefined) }) },
         };
       } catch (error) {
-        return buildOracleToolErrorResult("oracle_cancel", error, params as unknown as Record<string, unknown>);
+        return buildOracleToolErrorResult("oracle_cancel", error, params);
       }
     },
   });

@@ -5,6 +5,7 @@
 // Invariants/Assumptions: Job summaries read from durable job state, and lifecycle event trails are bounded and already normalized by shared lifecycle helpers.
 
 import { getLatestOracleJobLifecycleEvent, getLatestOracleTerminalLifecycleEvent } from "./job-lifecycle-helpers.mjs";
+import { parseTimestamp } from "./time-helpers.mjs";
 
 /** @typedef {import("./job-observability-helpers.d.mts").OracleJobSummaryLike} OracleJobSummaryLike */
 /** @typedef {import("./job-observability-helpers.d.mts").OracleJobSummaryOptions} OracleJobSummaryOptions */
@@ -67,16 +68,6 @@ function formatOracleSelection(selection) {
 const ACTIVE_SUMMARY_STATUSES = new Set(["preparing", "submitted", "waiting"]);
 const DEFAULT_ORACLE_HEARTBEAT_STALE_MS = 3 * 60 * 1000;
 const DEFAULT_ACTIVE_JOB_POLL_HINT_SECONDS = 15;
-
-/**
- * @param {string | undefined} value
- * @returns {number | undefined}
- */
-function parseTimestamp(value) {
-  if (!value) return undefined;
-  const ms = Date.parse(value);
-  return Number.isNaN(ms) ? undefined : ms;
-}
 
 /**
  * @param {number} elapsedMs
@@ -254,19 +245,28 @@ export function formatOracleSubmitResponse(job, options) {
 
 /**
  * @param {OracleStatusCounts} counts
+ * @param {"unavailable" | "loaded" | "auth_needed" | "config_error" | "ready"} [readiness]
  * @returns {string}
  */
-export function buildOracleStatusText(counts) {
+export function buildOracleStatusText(counts, readiness = "loaded") {
+  const readinessText = {
+    unavailable: "unavailable",
+    loaded: "loaded",
+    auth_needed: "auth needed",
+    config_error: "config error",
+    ready: "ready",
+  }[readiness] ?? "loaded";
+  const readinessSuffix = readiness === "ready" ? "" : `, ${readinessText}`;
   if (counts.active > 0 && counts.queued > 0) {
-    return `oracle: running (${counts.active}), queued (${counts.queued})`;
+    return `oracle: running (${counts.active}), queued (${counts.queued})${readinessSuffix}`;
   }
   if (counts.active > 0) {
     const suffix = counts.active > 1 ? ` (${counts.active})` : "";
-    return `oracle: running${suffix}`;
+    return `oracle: running${suffix}${readinessSuffix}`;
   }
   if (counts.queued > 0) {
     const suffix = counts.queued > 1 ? ` (${counts.queued})` : "";
-    return `oracle: queued${suffix}`;
+    return `oracle: queued${suffix}${readinessSuffix}`;
   }
-  return "oracle: ready";
+  return `oracle: ${readinessText}`;
 }

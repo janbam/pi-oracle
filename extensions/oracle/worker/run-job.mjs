@@ -5,7 +5,7 @@
 // Invariants/Assumptions: Job state is persisted under worker-held locks, browser/session artifacts live under the configured oracle directories, and cleanup preserves durable recovery semantics.
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { appendFile, chmod, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, chmod, cp as copyDirectory, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
@@ -19,21 +19,30 @@ import {
 } from "../shared/job-coordination-helpers.mjs";
 import { applyOracleJobCleanupWarnings, clearOracleJobCleanupState, transitionOracleJobPhase } from "../shared/job-lifecycle-helpers.mjs";
 import { spawnDetachedNodeProcess, terminateTrackedProcess } from "../shared/process-helpers.mjs";
+import { getOracleJobsDir } from "../shared/state-path-helpers.mjs";
 import { extractArtifactLabels, FILE_LABEL_PATTERN_SOURCE, GENERIC_ARTIFACT_LABELS, parseSnapshotEntries, partitionStructuralArtifactCandidates } from "./artifact-heuristics.mjs";
 import {
   buildAllowedChatGptOrigins,
   deriveAssistantCompletionSignature,
+  matchesCompactIntelligenceControlLabel,
+  matchesCompactIntelligenceOpenerLabel,
   matchesModelFamilyLabel,
+  matchesRequestedModelControlLabel,
   requestedEffortLabel,
   effortSelectionVisible,
   snapshotCanSafelySkipModelConfiguration,
+  snapshotHasClosedCompactSelection,
   snapshotHasModelConfigurationUi,
+  snapshotHasModelOpener,
   snapshotHasUsableComposerControls,
   snapshotStronglyMatchesRequestedModel,
   snapshotWeaklyMatchesRequestedModel,
   autoSwitchToThinkingSelectionVisible,
+  stripChatGptResponseChrome,
 } from "./chatgpt-ui-helpers.mjs";
-import { assistantSnapshotSlice, nextStableValueState, resolveStableConversationUrlCandidate, stripUrlQueryAndHash } from "./chatgpt-flow-helpers.mjs";
+import { assistantSnapshotSlice, conversationIdFromUrl, nextStableValueState, providerSendAccepted, resolveStableConversationUrlCandidate, stripUrlQueryAndHash } from "./chatgpt-flow-helpers.mjs";
+import { normalizeLoginProbeResult } from "./auth-flow-helpers.mjs";
+import { assertNotKnownBrowserUserDataPath, scrubSweetCookieSafeStoragePasswordEnv, sweetCookieSafeStoragePasswordScrubbedEnv } from "../shared/browser-profile-helpers.mjs";
 import { createLease, listLeaseMetadata, readLeaseMetadata, releaseLease, withLock } from "./state-locks.mjs";
 
 const jobId = process.argv[2];
@@ -42,9 +51,7 @@ if (!jobId) {
   process.exit(1);
 }
 
-const DEFAULT_ORACLE_JOBS_DIR = "/tmp";
-const ORACLE_JOBS_DIR = process.env.PI_ORACLE_JOBS_DIR?.trim() || DEFAULT_ORACLE_JOBS_DIR;
-const jobDir = join(ORACLE_JOBS_DIR, `oracle-${jobId}`);
+const jobDir = join(getOracleJobsDir(), `oracle-${jobId}`);
 const jobPath = `${jobDir}/job.json`;
 const CHATGPT_LABELS = {
   composer: "Chat with ChatGPT",
@@ -73,6 +80,7 @@ const ARTIFACT_DOWNLOAD_TIMEOUT_MS = 90_000;
 const ARTIFACT_DOWNLOAD_MAX_ATTEMPTS = 2;
 const AGENT_BROWSER_CLOSE_TIMEOUT_MS = 10_000;
 const PROFILE_CLONE_TIMEOUT_MS = 120_000;
+const MODEL_CONFIGURATION_OPEN_TIMEOUT_MS = 45_000;
 const MODEL_CONFIGURATION_SETTLE_TIMEOUT_MS = 20_000;
 const MODEL_CONFIGURATION_SETTLE_POLL_MS = 250;
 const MODEL_CONFIGURATION_CLOSE_RETRY_MS = 1_000;
@@ -80,9 +88,15 @@ const POST_SEND_SETTLE_MS = 15_000;
 const AGENT_BROWSER_BIN = [process.env.AGENT_BROWSER_PATH, "/opt/homebrew/bin/agent-browser", "/usr/local/bin/agent-browser"].find(
   (candidate) => typeof candidate === "string" && candidate && existsSync(candidate),
 ) || "agent-browser";
+const CHROME_DEVTOOLS_READY_TIMEOUT_MS = 15_000;
+const CP_BIN = process.env.PI_ORACLE_CP_PATH?.trim() || "cp";
+scrubSweetCookieSafeStoragePasswordEnv();
 
+let cpSupportsApfsCloneFlag;
 let currentJob;
 let browserStarted = false;
+let browserProcess;
+let browserProcessError;
 let cleaningUpBrowser = false;
 let cleaningUpRuntime = false;
 let shuttingDown = false;
@@ -209,12 +223,30 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function killProcessTree(child) {
+  if (process.platform === "win32" && child.pid) {
+    spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore", windowsHide: true }).on("error", () => undefined);
+    return;
+  }
+  child.kill("SIGTERM");
+}
+
+function killProcess(child) {
+  if (process.platform === "win32" && child.pid) {
+    spawn("taskkill", ["/pid", String(child.pid), "/f"], { stdio: "ignore", windowsHide: true }).on("error", () => undefined);
+    return;
+  }
+  child.kill("SIGKILL");
+}
+
 function spawnCommand(command, args, options = {}) {
   return new Promise((resolve, reject) => {
     const { timeoutMs, ...spawnOptions } = options;
     const child = spawn(command, args, {
       stdio: ["pipe", "pipe", "pipe"],
       ...spawnOptions,
+      env: sweetCookieSafeStoragePasswordScrubbedEnv(spawnOptions.env),
+      shell: spawnOptions.shell ?? process.platform === "win32",
     });
     let stdout = "";
     let stderr = "";
@@ -223,8 +255,8 @@ function spawnCommand(command, args, options = {}) {
     if (typeof timeoutMs === "number" && timeoutMs > 0) {
       killTimer = setTimeout(() => {
         timedOut = true;
-        child.kill("SIGTERM");
-        setTimeout(() => child.kill("SIGKILL"), 2_000).unref?.();
+        killProcessTree(child);
+        setTimeout(() => killProcess(child), 2_000).unref?.();
       }, timeoutMs);
       killTimer.unref?.();
     }
@@ -254,15 +286,12 @@ function spawnCommand(command, args, options = {}) {
   });
 }
 
-function parseConversationId(chatUrl) {
-  if (!chatUrl) return undefined;
-  try {
-    const parsed = new URL(chatUrl);
-    const match = parsed.pathname.match(/\/(?:c|chat)\/([^/?#]+)/i);
-    return match?.[1];
-  } catch {
-    return undefined;
-  }
+async function cpSupportsApfsClone() {
+  if (process.platform !== "darwin") return false;
+  if (cpSupportsApfsCloneFlag !== undefined) return cpSupportsApfsCloneFlag;
+  const probe = await spawnCommand(CP_BIN, ["-c"], { allowFailure: true, timeoutMs: 5_000 });
+  cpSupportsApfsCloneFlag = !/invalid option\s+--\s+['"]?c/i.test(`${probe.stderr}\n${probe.stdout}`);
+  return cpSupportsApfsCloneFlag;
 }
 
 async function removeChromiumProcessSingletonArtifacts(profileDir) {
@@ -274,8 +303,20 @@ async function removeChromiumProcessSingletonArtifacts(profileDir) {
   ]);
 }
 
+function assertSafeRuntimeProfilePath(path, label, config = undefined) {
+  try {
+    assertNotKnownBrowserUserDataPath(path, label, {
+      cookieSources: config ? { chromeProfile: config.auth.chromeProfile, chromeCookiePath: config.auth.chromeCookiePath } : undefined,
+    });
+  } catch (error) {
+    throw new Error(`Oracle ${label} path is unsafe: ${path}. ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 async function cloneSeedProfileToRuntime(job) {
   const seedDir = job.config.browser.authSeedProfileDir;
+  assertSafeRuntimeProfilePath(seedDir, "auth seed profile", job.config);
+  assertSafeRuntimeProfilePath(job.runtimeProfileDir, "runtime profile", job.config);
   if (!existsSync(seedDir)) {
     throw new Error(`Oracle auth seed profile not found: ${seedDir}. Run /oracle-auth first.`);
   }
@@ -286,17 +327,17 @@ async function cloneSeedProfileToRuntime(job) {
   await withLock(ORACLE_STATE_DIR, "auth", "global", { jobId: job.id, processPid: process.pid, action: "cloneSeedProfile" }, async () => {
     await rm(job.runtimeProfileDir, { recursive: true, force: true }).catch(() => undefined);
     await ensurePrivateDir(dirname(job.runtimeProfileDir));
-    if (job.config.browser.cloneStrategy === "apfs-clone") {
+    if (job.config.browser.cloneStrategy === "apfs-clone" && await cpSupportsApfsClone()) {
       try {
-        await spawnCommand("/bin/cp", ["-cR", seedDir, job.runtimeProfileDir], { timeoutMs: PROFILE_CLONE_TIMEOUT_MS });
+        await spawnCommand(CP_BIN, ["-cR", seedDir, job.runtimeProfileDir], { timeoutMs: PROFILE_CLONE_TIMEOUT_MS });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         await log(`APFS clone copy failed; falling back to recursive copy: ${message}`);
         await rm(job.runtimeProfileDir, { recursive: true, force: true }).catch(() => undefined);
-        await spawnCommand("/bin/cp", ["-R", seedDir, job.runtimeProfileDir], { timeoutMs: PROFILE_CLONE_TIMEOUT_MS });
+        await spawnCommand(CP_BIN, ["-R", seedDir, job.runtimeProfileDir], { timeoutMs: PROFILE_CLONE_TIMEOUT_MS });
       }
     } else {
-      await spawnCommand("/bin/cp", ["-R", seedDir, job.runtimeProfileDir], { timeoutMs: PROFILE_CLONE_TIMEOUT_MS });
+      await copyDirectory(seedDir, job.runtimeProfileDir, { recursive: true, force: true, verbatimSymlinks: true });
     }
     await removeChromiumProcessSingletonArtifacts(job.runtimeProfileDir);
   }, 10 * 60 * 1000);
@@ -309,32 +350,41 @@ async function cleanupRuntime(job) {
   cleaningUpRuntime = true;
   const warnings = [];
   try {
+    let browserClosed = true;
     await closeBrowser(job).catch(async (error) => {
+      browserClosed = false;
       const message = `Browser close warning during cleanup: ${error instanceof Error ? error.message : String(error)}`;
       warnings.push(message);
       await log(message).catch(() => undefined);
     });
-    await rm(job.runtimeProfileDir, { recursive: true, force: true }).catch(async (error) => {
-      const message = `Runtime profile cleanup warning: ${error instanceof Error ? error.message : String(error)}`;
+    if (browserClosed) {
+      try {
+        assertSafeRuntimeProfilePath(job.runtimeProfileDir, "runtime profile", job.config);
+        await rm(job.runtimeProfileDir, { recursive: true, force: true });
+      } catch (error) {
+        const message = `Runtime profile cleanup warning: ${error instanceof Error ? error.message : String(error)}`;
+        warnings.push(message);
+        await log(message).catch(() => undefined);
+      }
+    } else {
+      const message = `Runtime profile cleanup skipped because isolated browser close did not complete: ${job.runtimeProfileDir}`;
+      warnings.push(message);
+      await log(message).catch(() => undefined);
+    }
+    await releaseLease(ORACLE_STATE_DIR, "conversation", job.conversationId).catch(async (error) => {
+      const message = `Conversation lease cleanup warning: ${error instanceof Error ? error.message : String(error)}`;
+      warnings.push(message);
+      await log(message).catch(() => undefined);
+    });
+    await releaseLease(ORACLE_STATE_DIR, "runtime", job.runtimeId).catch(async (error) => {
+      const message = `Runtime lease cleanup warning: ${error instanceof Error ? error.message : String(error)}`;
       warnings.push(message);
       await log(message).catch(() => undefined);
     });
     if (warnings.length === 0) {
-      await releaseLease(ORACLE_STATE_DIR, "conversation", job.conversationId).catch(async (error) => {
-        const message = `Conversation lease cleanup warning: ${error instanceof Error ? error.message : String(error)}`;
-        warnings.push(message);
-        await log(message).catch(() => undefined);
-      });
-      await releaseLease(ORACLE_STATE_DIR, "runtime", job.runtimeId).catch(async (error) => {
-        const message = `Runtime lease cleanup warning: ${error instanceof Error ? error.message : String(error)}`;
-        warnings.push(message);
-        await log(message).catch(() => undefined);
-      });
-    }
-    if (warnings.length === 0) {
       await log(`Cleanup summary: runtime ${job.runtimeId} released with no warnings`).catch(() => undefined);
     } else {
-      await log(`Cleanup summary: runtime ${job.runtimeId} released with ${warnings.length} warning(s)`).catch(() => undefined);
+      await log(`Cleanup summary: runtime ${job.runtimeId} released after ${warnings.length} warning(s)`).catch(() => undefined);
     }
     return warnings;
   } finally {
@@ -495,6 +545,39 @@ function browserBaseArgs(job, options = {}) {
   return args;
 }
 
+function waitForChildClose(child, timeoutMs) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve(false);
+    }, timeoutMs);
+    timer.unref?.();
+    child.once("close", () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(true);
+    });
+  });
+}
+
+async function terminateBrowserProcess() {
+  if (!browserProcess) return;
+  const child = browserProcess;
+  browserProcess = undefined;
+  browserProcessError = undefined;
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  killProcessTree(child);
+  if (await waitForChildClose(child, 2_000)) return;
+  killProcess(child);
+  if (!(await waitForChildClose(child, 2_000))) {
+    throw new Error(`Timed out terminating isolated Chrome process ${child.pid ?? "(unknown pid)"}`);
+  }
+}
+
 async function closeBrowser(job) {
   if (cleaningUpBrowser) return;
   cleaningUpBrowser = true;
@@ -507,15 +590,107 @@ async function closeBrowser(job) {
       throw new Error(result.stderr || result.stdout || `agent-browser close exited with code ${result.code}`);
     }
   } finally {
+    await terminateBrowserProcess();
     browserStarted = false;
     cleaningUpBrowser = false;
   }
 }
 
+function assertSafeBrowserLaunchArg(arg) {
+  const value = String(arg).trim().toLowerCase();
+  const managedFlags = [
+    "--user-data-dir",
+    "--remote-debugging-port",
+    "--remote-debugging-pipe",
+    "--remote-debugging-address",
+    "--remote-allow-origins",
+  ];
+  const flag = managedFlags.find((candidate) => value === candidate || value.startsWith(`${candidate}=`) || value.startsWith(`${candidate} `));
+  if (flag) {
+    throw new Error(`browser.args cannot override oracle-managed Chrome launch isolation flag ${flag}`);
+  }
+}
+
+function safeBrowserLaunchArgs(job) {
+  if (!Array.isArray(job.config.browser.args)) return [];
+  for (const arg of job.config.browser.args) assertSafeBrowserLaunchArg(arg);
+  return job.config.browser.args;
+}
+
+function chromeLaunchArgs(job, url) {
+  const args = [
+    "--remote-debugging-port=0",
+    "--remote-allow-origins=*",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-background-networking",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-component-update",
+    "--disable-default-apps",
+    "--disable-hang-monitor",
+    "--disable-popup-blocking",
+    "--disable-prompt-on-repost",
+    "--disable-sync",
+    "--disable-features=Translate",
+    "--enable-features=NetworkService,NetworkServiceInProcess",
+    "--metrics-recording-only",
+    "--password-store=basic",
+    "--use-mock-keychain",
+    "--enable-unsafe-swiftshader",
+    "--window-size=1280,720",
+    `--user-data-dir=${job.runtimeProfileDir}`,
+  ];
+  if (job.config.browser.runMode !== "headed") args.push("--headless=new", "--hide-scrollbars");
+  if (job.config.browser.userAgent) args.push(`--user-agent=${job.config.browser.userAgent}`);
+  args.push(...safeBrowserLaunchArgs(job));
+  args.push(url);
+  return args;
+}
+
+async function waitForDevToolsEndpoint(job) {
+  const path = join(job.runtimeProfileDir, "DevToolsActivePort");
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < CHROME_DEVTOOLS_READY_TIMEOUT_MS) {
+    if (browserProcessError) {
+      throw new Error(`Chrome failed before DevTools became available: ${browserProcessError instanceof Error ? browserProcessError.message : String(browserProcessError)}`);
+    }
+    if (browserProcess?.exitCode !== null && browserProcess?.exitCode !== undefined) {
+      throw new Error(`Chrome exited before DevTools became available (exit code ${browserProcess.exitCode}).`);
+    }
+    if (existsSync(path)) {
+      const lines = (await readFile(path, "utf8")).trim().split(/\r?\n/);
+      const port = lines[0]?.trim();
+      const browserPath = lines[1]?.trim();
+      if (/^\d+$/.test(port)) {
+        return browserPath ? `ws://127.0.0.1:${port}${browserPath}` : `http://127.0.0.1:${port}`;
+      }
+    }
+    await sleep(100);
+  }
+  throw new Error(`Timed out waiting for Chrome DevTools endpoint at ${path}.`);
+}
+
 async function launchBrowser(job, url) {
   await closeBrowser(job);
-  const mode = job.config.browser.runMode;
-  await spawnCommand(AGENT_BROWSER_BIN, [...browserBaseArgs(job, { withLaunchOptions: true, mode }), "open", url]);
+  const executablePath = job.config.browser.executablePath;
+  if (!executablePath) throw new Error("Oracle requires browser.executablePath when launching isolated browser runtimes without owning the global agent-browser daemon.");
+  const args = chromeLaunchArgs(job, url);
+  await log(`Launching isolated Chrome directly for agent-browser attach: ${JSON.stringify([executablePath, ...args])}`);
+  browserProcessError = undefined;
+  browserProcess = spawn(executablePath, args, {
+    env: sweetCookieSafeStoragePasswordScrubbedEnv(),
+    stdio: "ignore",
+    detached: false,
+    shell: false,
+  });
+  browserProcess.on("error", (error) => {
+    browserProcessError = error;
+    log(`Chrome process error: ${error instanceof Error ? error.message : String(error)}`).catch(() => undefined);
+  });
+  const endpoint = await waitForDevToolsEndpoint(job);
+  await log(`Connecting agent-browser session ${job.runtimeSessionName} to isolated Chrome DevTools endpoint`);
+  await spawnCommand(AGENT_BROWSER_BIN, [...browserBaseArgs(job), "connect", endpoint]);
+  await spawnCommand(AGENT_BROWSER_BIN, [...browserBaseArgs(job), "open", url]);
   browserStarted = true;
 }
 
@@ -577,30 +752,12 @@ async function evalPage(job, script) {
 }
 
 async function loginProbe(job) {
-  const result = await evalPage(job, buildLoginProbeScript(5_000));
-  if (!result || typeof result !== "object") {
-    return { ok: false, status: 0, error: "invalid-probe-result" };
-  }
-  return {
-    ok: result.ok === true,
-    status: typeof result.status === "number" ? result.status : 0,
-    pageUrl: typeof result.pageUrl === "string" ? result.pageUrl : undefined,
-    domLoginCta: result.domLoginCta === true,
-    onAuthPage: result.onAuthPage === true,
-    error: typeof result.error === "string" ? result.error : undefined,
-    bodyKeys: Array.isArray(result.bodyKeys) ? result.bodyKeys : [],
-    bodyHasId: result.bodyHasId === true,
-    bodyHasEmail: result.bodyHasEmail === true,
-  };
+  return normalizeLoginProbeResult(await evalPage(job, buildLoginProbeScript(5_000)));
 }
 
 async function currentUrl(job) {
   const { stdout } = await agentBrowser(job, "get", "url");
   return stdout;
-}
-
-function stripQuery(url) {
-  return stripUrlQueryAndHash(url);
 }
 
 async function snapshotText(job) {
@@ -723,11 +880,43 @@ function matchesModelFamilyControl(candidate, family) {
   return ["button", "radio", "menuitemradio"].includes(candidate.kind || "") && typeof candidate.label === "string" && matchesModelFamilyLabel(candidate.label, family) && !candidate.disabled;
 }
 
+function normalizeSnapshotLabel(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function snapshotHasLegacyEffortCombobox(snapshot) {
+  return Boolean(findEntry(snapshot, (candidate) => {
+    if (candidate.kind !== "combobox" || candidate.disabled) return false;
+    return /^(?:Thinking effort|Pro thinking effort)$/i.test(normalizeSnapshotLabel(candidate.label));
+  }));
+}
+
+function snapshotHasCompactIntelligenceMenuControls(snapshot) {
+  return Boolean(findEntry(snapshot, (candidate) => {
+    if (candidate.disabled) return false;
+    const label = normalizeSnapshotLabel(candidate.label);
+    return (candidate.kind === "menu" && /(?:Intelligence.*Instant.*Medium.*High.*Pro|^(?:Instant|Medium|High|Extra High|Pro(?: Standard| Extended)?)$)/i.test(label))
+      || (candidate.kind === "menuitemradio" && /^(?:Instant\s+[\d.]+s?|Medium(?:\s+5\s*[–-]\s*30s)?|High(?:\s+15\s*[–-]\s*60s)?|Extra High|Pro(?:\s+5\+\s*min|\s+Standard|\s+Extended)?)$/i.test(label));
+  }));
+}
+
+function matchesRequestedModelControl(candidate, selection, options = {}) {
+  if (!["button", "radio", "menuitemradio"].includes(candidate.kind || "") || typeof candidate.label !== "string" || candidate.disabled) return false;
+  if (candidate.kind === "button") {
+    if (/\bexpanded=true\b/.test(String(candidate.line || ""))) return false;
+    if (options.ignoreCompactTierButtons && /^(?:Instant(?:\s+[\d.]+s?)?|Medium|High|Extra High|Pro(?: Standard| Extended)?)$/i.test(candidate.label)) return false;
+    if (options.ignoreCompactOnlyButtons && /^(?:Medium|High|Extra High)$/i.test(candidate.label)) return false;
+  }
+  if (selection.modelFamily === "pro" && /^Pro(?:\s+Extended)?$/i.test(candidate.label)) return true;
+  return matchesRequestedModelControlLabel(candidate.label, selection);
+}
+
 function matchesModelConfigurationOpener(candidate) {
   if (candidate.kind !== "button" || typeof candidate.label !== "string" || candidate.disabled) return false;
   const label = String(candidate.label || "");
   return candidate.label === "Model"
     || candidate.label === "Model selector"
+    || matchesCompactIntelligenceOpenerLabel(label)
     || /^(?:Light|Standard|Extended|Heavy)(?:, click to remove)?$/i.test(label)
     || ["instant", "thinking", "pro"].some((family) => matchesModelFamilyLabel(label, /** @type {import("./chatgpt-ui-helpers.d.mts").OracleUiModelFamily} */ (family)))
     || /^(?:(?:Light|Standard|Extended|Heavy) )?Thinking(?:, click to remove)?$/i.test(label)
@@ -792,7 +981,41 @@ async function maybeClickLabeledEntry(job, label, options = {}) {
 }
 
 async function openEffortDropdown(job) {
-  const snapshot = await snapshotText(job);
+  let snapshot = await snapshotText(job);
+  if (job.selection?.modelFamily === "pro") {
+    let proEffortEntry = findEntry(
+      snapshot,
+      (candidate) => candidate.kind === "menuitem" && candidate.label === "Pro effort options" && !candidate.disabled,
+    );
+    if (!proEffortEntry) {
+      const opener = findEntry(snapshot, matchesModelConfigurationOpener);
+      if (opener) {
+        await clickRef(job, opener.ref);
+        await agentBrowser(job, "wait", "500");
+        snapshot = await snapshotText(job);
+        proEffortEntry = findEntry(
+          snapshot,
+          (candidate) => candidate.kind === "menuitem" && candidate.label === "Pro effort options" && !candidate.disabled,
+        );
+      }
+    }
+    if (proEffortEntry) {
+      try {
+        await clickRef(job, proEffortEntry.ref);
+        return true;
+      } catch {
+        // Fall through to DOM click. ChatGPT's tiny trailing Pro effort icon can
+        // be covered at the accessibility click point by the parent Pro row.
+      }
+    }
+    const clicked = await evalPage(job, toJsonScript(`
+      const el = document.querySelector('[aria-label="Pro effort options"], [data-composer-intelligence-pro-effort-action]');
+      if (!el) return false;
+      el.click();
+      return true;
+    `));
+    if (clicked) return true;
+  }
   const effortLabels = new Set(["Light", "Standard", "Extended", "Heavy"]);
   const entry = findEntry(
     snapshot,
@@ -842,15 +1065,9 @@ function classifyChatPage({ job, url, snapshot, body, probe }) {
     return { state: "challenge_blocking", message: "ChatGPT is showing a challenge/verification page" };
   }
 
-  const outagePatterns = [
-    /something went wrong/i,
-    /a network error occurred/i,
-    /an error occurred while connecting to the websocket/i,
-    /try again later/i,
-    /rate limit/i,
-  ];
-  if (outagePatterns.some((pattern) => pattern.test(text))) {
-    return { state: "transient_outage_error", message: "ChatGPT is showing a transient outage/error page" };
+  const outageText = detectProviderTransientErrorText(text);
+  if (outageText) {
+    return { state: "transient_outage_error", message: `ChatGPT is showing a transient outage/rate-limit page: ${outageText}` };
   }
 
   const allowedOrigins = buildAllowedChatGptOrigins(job.config.browser.chatUrl, job.config.browser.authUrl);
@@ -913,8 +1130,9 @@ function classifyGrokPage({ url, snapshot, body }) {
   if (/captcha|cloudflare|verify you are human|unusual activity|suspicious activity/i.test(text)) {
     return { state: "challenge_blocking", message: "Grok is showing a challenge/verification page" };
   }
-  if (/something went wrong|network error|try again later|rate limit/i.test(text)) {
-    return { state: "transient_outage_error", message: "Grok is showing a transient outage/error page" };
+  const outageText = detectProviderTransientErrorText(text);
+  if (outageText) {
+    return { state: "transient_outage_error", message: `Grok is showing a transient outage/rate-limit page: ${outageText}` };
   }
   const onGrokOrigin = typeof url === "string" && url.startsWith("https://grok.com");
   if (onGrokOrigin && hasGrokLoginCta(text)) {
@@ -1015,6 +1233,42 @@ function detectUploadErrorText(text) {
   return patterns.find((pattern) => text.toLowerCase().includes(pattern.toLowerCase()));
 }
 
+function detectProviderTransientErrorText(text) {
+  const patterns = [
+    "Too many requests",
+    "rate limit",
+    "try again later",
+    "Something went wrong",
+    "A network error occurred",
+    "An error occurred while connecting to the websocket",
+  ];
+  return patterns.find((pattern) => text.toLowerCase().includes(pattern.toLowerCase()));
+}
+
+function detectProviderVisibleBlockerText(text) {
+  const patterns = [
+    "Too many requests",
+    "rate limit",
+  ];
+  return patterns.find((pattern) => text.toLowerCase().includes(pattern.toLowerCase()));
+}
+
+function formatProviderTransientErrorMessage(job, errorText, context) {
+  const providerLabel = isGrokJob(job) ? "Grok" : "ChatGPT";
+  return `${providerLabel} is showing a transient outage/rate-limit page${context ? ` while ${context}` : ""}: ${errorText}`;
+}
+
+function providerTransientErrorMessage(job, text, context) {
+  const errorText = detectProviderVisibleBlockerText(text);
+  if (!errorText) return "";
+  return formatProviderTransientErrorMessage(job, errorText, context);
+}
+
+function throwIfProviderTransientError(job, text, context) {
+  const message = providerTransientErrorMessage(job, text, context);
+  if (message) throw new Error(message);
+}
+
 function detectResponseFailureText(text) {
   const patterns = [
     "Message delivery timed out",
@@ -1054,6 +1308,7 @@ async function waitForUploadConfirmed(job, fileLabel, baselineCount) {
   while (Date.now() < timeoutAt) {
     await heartbeat();
     const [snapshot, body] = await Promise.all([snapshotText(job), pageText(job).catch(() => "")]);
+    throwIfProviderTransientError(job, snapshot, "uploading the archive");
 
     const errorText = detectUploadErrorText(`${snapshot}\n${body}`);
     if (errorText) {
@@ -1088,6 +1343,7 @@ async function waitForSendReady(job) {
     await heartbeat();
     const snapshot = await snapshotText(job);
     const body = await pageText(job).catch(() => "");
+    throwIfProviderTransientError(job, snapshot, "waiting for send readiness");
     const errorText = detectUploadErrorText(`${snapshot}\n${body}`);
     if (errorText) {
       throw new Error(`Upload error detected: ${errorText}`);
@@ -1104,46 +1360,133 @@ async function waitForSendReady(job) {
   throw new Error(`Timed out waiting for ${labelsForJob(job).send} to become enabled`);
 }
 
-async function clickSend(job) {
-  const entry = await waitForSendReady(job);
-  if (isGrokJob(job)) {
-    const result = await evalPage(job, toJsonScript(`
-      const button = document.querySelector('button[aria-label="Submit"]');
-      if (!button || button.disabled) return { ok: false };
-      button.click();
-      return { ok: true };
-    `));
-    if (result?.ok) return;
+async function activateSendButton(job) {
+  const result = await evalPage(job, toJsonScript(`
+    const labels = ${JSON.stringify(labelsForJob(job))};
+    const buttons = Array.from(document.querySelectorAll('button'));
+    const button = buttons.find((candidate) => {
+      const label = (candidate.getAttribute('aria-label') || candidate.textContent || '').trim();
+      return label === labels.send;
+    });
+    if (!button) return { ok: false, reason: 'send button not found' };
+    if (button.disabled || button.getAttribute('aria-disabled') === 'true') return { ok: false, reason: 'send button disabled' };
+    button.click();
+    return { ok: true };
+  `));
+  return result;
+}
+
+async function sendAcceptanceState(job, baselineAssistantCount) {
+  const [urlResult, snapshot, messages] = await Promise.all([
+    currentUrl(job).then((url) => ({ url, ok: true })).catch(() => ({ url: "", ok: false })),
+    snapshotText(job).catch(() => ""),
+    assistantMessages(job).catch(() => []),
+  ]);
+  return {
+    url: urlResult.url,
+    urlKnown: urlResult.ok,
+    assistantCount: Math.max(baselineAssistantCount, messages.length),
+    stopStreaming: isGrokJob(job) ? snapshot.includes(GROK_LABELS.stop) : snapshot.includes("Stop streaming"),
+    transientErrorText: detectProviderVisibleBlockerText(snapshot) || "",
+  };
+}
+
+async function clickSend(job, baselineAssistantCount) {
+  await waitForSendReady(job);
+  const beforeSend = await sendAcceptanceState(job, baselineAssistantCount);
+  const activation = await activateSendButton(job);
+  if (!activation?.ok) throw new Error(`Could not activate ${labelsForJob(job).send}: ${activation?.reason || "DOM activation failed"}`);
+  await log(`Activated ${labelsForJob(job).send}; waiting for provider acceptance evidence`);
+  if (await waitForSendAccepted(job, beforeSend, { timeoutMs: 20_000 })) return;
+
+  await captureDiagnostics(job, "send-not-accepted");
+  throw new Error(`${isGrokJob(job) ? "Grok" : "ChatGPT"} message did not leave the composer after activating ${labelsForJob(job).send}`);
+}
+
+async function waitForSendAccepted(job, beforeSend, options = {}) {
+  const timeoutAt = Date.now() + (options.timeoutMs || 15_000);
+  while (Date.now() < timeoutAt) {
+    await heartbeat();
+    const afterSend = await sendAcceptanceState(job, beforeSend.assistantCount || 0);
+    if (afterSend.transientErrorText) throw new Error(formatProviderTransientErrorMessage(job, afterSend.transientErrorText, "waiting for send acceptance"));
+    if (providerSendAccepted(beforeSend, afterSend)) return true;
+    await sleep(500);
   }
-  await clickRef(job, entry.ref);
+  return false;
+}
+
+async function dismissProFeedbackModal(job, snapshot) {
+  const entries = parseSnapshotEntries(snapshot);
+  const hasProFeedback = entries.some((entry) => entry.kind === "heading" && entry.label === "Pro feedback" && !entry.disabled);
+  if (!hasProFeedback) return false;
+  const close = entries.find((entry) => entry.kind === "button" && entry.label === CHATGPT_LABELS.close && !entry.disabled);
+  if (close) {
+    await clickRef(job, close.ref).catch(() => undefined);
+    await agentBrowser(job, "wait", "500");
+    if (!(await pageText(job).catch(() => "")).includes("Pro feedback")) return true;
+  }
+  await agentBrowser(job, "press", "Escape").catch(() => undefined);
+  await agentBrowser(job, "wait", "500");
+  if (!(await pageText(job).catch(() => "")).includes("Pro feedback")) return true;
+
+  const dismissed = await evalPage(job, toJsonScript(`
+    const dialogText = document.body.innerText || '';
+    if (!/Pro feedback/.test(dialogText)) return false;
+    const button = Array.from(document.querySelectorAll('button'))
+      .find((candidate) => (candidate.getAttribute('aria-label') || candidate.textContent || '').trim() === 'Close');
+    if (!button) return false;
+    button.click();
+    return true;
+  `));
+  if (dismissed) await agentBrowser(job, "wait", "500");
+  return Boolean(dismissed);
 }
 
 async function openModelConfiguration(job) {
-  const initialSnapshot = await snapshotText(job);
-  if (snapshotHasModelConfigurationUi(initialSnapshot)) return initialSnapshot;
+  const timeoutAt = Date.now() + MODEL_CONFIGURATION_OPEN_TIMEOUT_MS;
+  let lastSnapshot = "";
 
-  for (const predicate of [matchesModelConfigurationOpener]) {
-    const snapshot = await snapshotText(job);
-    const entry = findEntry(snapshot, predicate);
-    if (!entry) continue;
-    await clickRef(job, entry.ref);
-    await agentBrowser(job, "wait", "800");
-    const after = await snapshotText(job);
-    if (snapshotHasModelConfigurationUi(after)) return after;
-    if (canUseOpenModelMenuForSelection(after, job.selection)) return after;
+  while (Date.now() < timeoutAt) {
+    const initialSnapshot = await snapshotText(job);
+    lastSnapshot = initialSnapshot;
+    throwIfProviderTransientError(job, initialSnapshot, "opening model configuration");
+    if (snapshotHasModelConfigurationUi(initialSnapshot)) return initialSnapshot;
+    if (await dismissProFeedbackModal(job, initialSnapshot)) continue;
 
-    const configureEntry = findEntry(
-      after,
-      (candidate) => candidate.kind === "menuitem" && candidate.label === CHATGPT_LABELS.configure && !candidate.disabled,
-    );
+    for (const predicate of [matchesModelConfigurationOpener]) {
+      const snapshot = await snapshotText(job);
+      lastSnapshot = snapshot;
+      const entry = findEntry(snapshot, predicate);
+      if (!entry) continue;
+      await clickRef(job, entry.ref);
+      await agentBrowser(job, "wait", "800");
+      const after = await snapshotText(job);
+      lastSnapshot = after;
+      throwIfProviderTransientError(job, after, "opening model configuration");
+      if (snapshotHasModelConfigurationUi(after)) return after;
+      if (canUseOpenModelMenuForSelection(after, job.selection)) return after;
 
-    if (configureEntry) {
-      await clickRef(job, configureEntry.ref);
-      await agentBrowser(job, "wait", "1200");
-      const postConfigure = await snapshotText(job);
-      if (snapshotHasModelConfigurationUi(postConfigure)) return postConfigure;
-      if (canUseOpenModelMenuForSelection(postConfigure, job.selection)) return postConfigure;
+      const configureEntry = findEntry(
+        after,
+        (candidate) => candidate.kind === "menuitem" && candidate.label === CHATGPT_LABELS.configure && !candidate.disabled,
+      );
+
+      if (configureEntry) {
+        await clickRef(job, configureEntry.ref);
+        await agentBrowser(job, "wait", "1200");
+        const postConfigure = await snapshotText(job);
+        lastSnapshot = postConfigure;
+        throwIfProviderTransientError(job, postConfigure, "opening model configuration");
+        if (snapshotHasModelConfigurationUi(postConfigure)) return postConfigure;
+        if (canUseOpenModelMenuForSelection(postConfigure, job.selection)) return postConfigure;
+      }
     }
+
+    if (composerControlsVisible(lastSnapshot, job) && !snapshotHasModelOpener(lastSnapshot)) {
+      await agentBrowser(job, "wait", "1000");
+      continue;
+    }
+    await agentBrowser(job, "wait", "500");
   }
 
   throw new Error("Could not open model configuration UI");
@@ -1210,51 +1553,86 @@ async function configureModel(job) {
   let verificationSnapshot = familySnapshot;
 
   const alreadyConfiguredInUi = snapshotStronglyMatchesRequestedModel(familySnapshot, job.selection);
-  let familyEntry = findEntry(familySnapshot, (candidate) => matchesModelFamilyControl(candidate, job.selection.modelFamily));
+  const legacyEffortComboboxVisible = snapshotHasLegacyEffortCombobox(familySnapshot);
+  const familyAlreadySelectedInUi = !alreadyConfiguredInUi && legacyEffortComboboxVisible && snapshotWeaklyMatchesRequestedModel(familySnapshot, job.selection);
+  const controlOptions = {
+    ignoreCompactTierButtons: snapshotHasCompactIntelligenceMenuControls(familySnapshot),
+    ignoreCompactOnlyButtons: legacyEffortComboboxVisible,
+  };
+  let familyEntry = alreadyConfiguredInUi || familyAlreadySelectedInUi
+    ? undefined
+    : findEntry(familySnapshot, (candidate) => matchesRequestedModelControl(candidate, job.selection, controlOptions));
   if (alreadyConfiguredInUi) {
     await log("Model configuration UI opened with requested settings already selected");
+  } else if (familyAlreadySelectedInUi) {
+    await log("Model family already appears selected; verifying effort-specific settings");
   } else if (!familyEntry) {
     throw new Error(`Could not find model family control for ${job.selection.modelFamily}`);
   }
 
-  if (!alreadyConfiguredInUi && familyEntry) {
+  let compactSelectionVerifiedAfterClick = false;
+  if (!alreadyConfiguredInUi && !familyAlreadySelectedInUi && familyEntry) {
+    const clickedCompactControl = matchesCompactIntelligenceControlLabel(familyEntry.label);
     await clickRef(job, familyEntry.ref);
     await agentBrowser(job, "wait", "800");
     familySnapshot = await snapshotText(job);
     verificationSnapshot = familySnapshot;
-    familyEntry = findEntry(familySnapshot, (candidate) => matchesModelFamilyControl(candidate, job.selection.modelFamily));
-    if (!familyEntry && !snapshotStronglyMatchesRequestedModel(familySnapshot, job.selection)) {
+    compactSelectionVerifiedAfterClick = clickedCompactControl && snapshotHasClosedCompactSelection(familySnapshot, job.selection);
+    if (compactSelectionVerifiedAfterClick) {
+      await log(`Verified compact ChatGPT selection after menu close for family=${job.selection.modelFamily} effort=${job.selection?.effort || "(none)"}`);
+    }
+    const postClickControlOptions = {
+      ignoreCompactTierButtons: snapshotHasCompactIntelligenceMenuControls(familySnapshot),
+      ignoreCompactOnlyButtons: snapshotHasLegacyEffortCombobox(familySnapshot),
+    };
+    familyEntry = findEntry(familySnapshot, (candidate) => matchesRequestedModelControl(candidate, job.selection, postClickControlOptions));
+    if (!compactSelectionVerifiedAfterClick && !familyEntry && !snapshotStronglyMatchesRequestedModel(familySnapshot, job.selection)) {
       throw new Error(`Requested model family did not remain selected: ${job.selection.modelFamily}`);
     }
   }
 
-  if (job.selection.modelFamily === "thinking" || job.selection.modelFamily === "pro") {
+  if ((job.selection.modelFamily === "thinking" || job.selection.modelFamily === "pro") && !compactSelectionVerifiedAfterClick) {
     const effortLabel = requestedEffortLabel(job.selection);
     if (effortLabel && !effortSelectionVisible(familySnapshot, effortLabel)) {
       const opened = await openEffortDropdown(job);
       if (!opened) {
-        throw new Error(`Could not open effort dropdown for requested effort: ${effortLabel}`);
+        // Current ChatGPT Pro menus sometimes expose only undifferentiated "Pro" with no Standard/Extended rows.
+        const afterOpenAttempt = await snapshotText(job);
+        if (job.selection.modelFamily === "pro" && snapshotStronglyMatchesRequestedModel(afterOpenAttempt, job.selection)) {
+          await log(`Pro effort dropdown unavailable for ${effortLabel}; accepting undifferentiated Pro selection`);
+          verificationSnapshot = afterOpenAttempt;
+          familySnapshot = afterOpenAttempt;
+        } else {
+          throw new Error(`Could not open effort dropdown for requested effort: ${effortLabel}`);
+        }
+      } else {
+        await agentBrowser(job, "wait", "300");
+        if (job.selection.modelFamily === "pro" && await maybeClickLabeledEntry(job, `Pro ${effortLabel}`, { kind: "menuitemradio" })) {
+          // Current ChatGPT exposes Pro effort choices as nested menu radio items.
+        } else {
+          await clickLabeledEntry(job, effortLabel, { kind: "option" });
+        }
+        await agentBrowser(job, "wait", "400");
+        const effortSnapshot = await snapshotText(job);
+        verificationSnapshot = effortSnapshot;
+        const selectedEffort = findEntry(
+          effortSnapshot,
+          (candidate) => candidate.kind === "combobox" && candidate.value === effortLabel && !candidate.disabled,
+        );
+        if (!selectedEffort && !effortSelectionVisible(effortSnapshot, effortLabel)) {
+          throw new Error(`Requested effort did not remain selected: ${effortLabel}`);
+        }
+        familySnapshot = effortSnapshot;
       }
-      await agentBrowser(job, "wait", "300");
-      await clickLabeledEntry(job, effortLabel, { kind: "option" });
-      await agentBrowser(job, "wait", "400");
-      const effortSnapshot = await snapshotText(job);
-      verificationSnapshot = effortSnapshot;
-      const selectedEffort = findEntry(
-        effortSnapshot,
-        (candidate) => candidate.kind === "combobox" && candidate.value === effortLabel && !candidate.disabled,
-      );
-      if (!selectedEffort && !effortSelectionVisible(effortSnapshot, effortLabel)) {
-        throw new Error(`Requested effort did not remain selected: ${effortLabel}`);
-      }
-      familySnapshot = effortSnapshot;
     }
   }
 
   if (job.selection.modelFamily === "instant") {
     const desiredAutoSwitchState = job.selection.autoSwitchToThinking === true;
     const currentAutoSwitchState = autoSwitchToThinkingSelectionVisible(familySnapshot);
-    if (currentAutoSwitchState !== desiredAutoSwitchState && (desiredAutoSwitchState || currentAutoSwitchState === true)) {
+    const compactInstantAlreadyVerified = compactSelectionVerifiedAfterClick
+      || (desiredAutoSwitchState && currentAutoSwitchState === undefined && snapshotStronglyMatchesRequestedModel(familySnapshot, job.selection));
+    if (!compactInstantAlreadyVerified && currentAutoSwitchState !== desiredAutoSwitchState && (desiredAutoSwitchState || currentAutoSwitchState === true)) {
       await clickAutoSwitchToThinkingControl(job);
       await agentBrowser(job, "wait", "400");
       verificationSnapshot = await snapshotText(job);
@@ -1262,7 +1640,7 @@ async function configureModel(job) {
     }
   }
 
-  const stronglyVerified = snapshotStronglyMatchesRequestedModel(verificationSnapshot, job.selection);
+  const stronglyVerified = compactSelectionVerifiedAfterClick || snapshotStronglyMatchesRequestedModel(verificationSnapshot, job.selection);
   if (!stronglyVerified) {
     throw new Error(`Could not verify requested model settings in configuration UI for ${job.selection.modelFamily}`);
   }
@@ -1440,12 +1818,15 @@ async function grokAssistantMessages(job) {
         return text;
       };
       const bubbles = Array.from(document.querySelectorAll('.message-bubble'));
+      const roleMessages = Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'));
       const sourceNodes = bubbles.length > 0
         ? bubbles
-        : Array.from(document.querySelectorAll('div')).filter((node) => {
-            const classText = String(node.className || '');
-            return classText.includes('group') && classText.includes('flex') && classText.includes('flex-col') && classText.includes('justify-center');
-          });
+        : roleMessages.length > 0
+          ? roleMessages
+          : Array.from(document.querySelectorAll('div')).filter((node) => {
+              const classText = String(node.className || '');
+              return classText.includes('group') && classText.includes('flex') && classText.includes('flex-col') && classText.includes('justify-center');
+            });
       const messages = sourceNodes
         .map((node) => node.closest('[data-message-author-role], [data-testid*="message"], .group') || node)
         .filter((node, index, all) => all.indexOf(node) === index)
@@ -1476,7 +1857,7 @@ async function waitForStableChatUrl(job, previousChatUrl) {
     await sleep(1000);
   }
 
-  return previousChatUrl || stripQuery(await currentUrl(job));
+  return previousChatUrl || stripUrlQueryAndHash(await currentUrl(job));
 }
 
 async function waitForChatCompletion(job, baselineAssistantCount) {
@@ -1491,6 +1872,7 @@ async function waitForChatCompletion(job, baselineAssistantCount) {
     const hasStopStreaming = isGrokJob(job) ? snapshot.includes(GROK_LABELS.stop) : snapshot.includes("Stop streaming");
     const hasRetryButton = snapshot.includes('button "Retry"');
     const copyResponseCount = isGrokJob(job) ? (snapshot.match(/button "Copy"/g) || []).length : (snapshot.match(/Copy response/g) || []).length;
+    throwIfProviderTransientError(job, snapshot, "waiting for response completion");
     const responseFailureText = detectResponseFailureText(`${snapshot}\n${body}`);
     const messages = await assistantMessages(job);
     const targetMessage = messages[baselineAssistantCount];
@@ -1844,7 +2226,7 @@ async function waitForStableArtifactCandidates(job, responseIndex, responseText 
 }
 
 async function reopenConversationForArtifacts(job, responseIndex, responseText, reason) {
-  const targetUrl = job.chatUrl || stripQuery(await currentUrl(job));
+  const targetUrl = job.chatUrl || stripUrlQueryAndHash(await currentUrl(job));
   await log(`Reopening conversation before artifact capture (${reason}): ${targetUrl}`);
   await agentBrowser(job, "open", targetUrl);
   await agentBrowser(job, "wait", "1500");
@@ -1966,15 +2348,8 @@ async function downloadArtifacts(job, responseIndex, responseText = "") {
     }
   }
 
-  const capturedArtifactLabels = new Set(artifacts.map((artifact) => artifact.displayName).filter(Boolean));
-  const capturedArtifactKeys = new Set([...capturedArtifactLabels].map((label) => String(label).replace(/\s+/g, "")));
-  const missedArtifactLabels = suspiciousLabels.filter((label) => !capturedArtifactLabels.has(label) && !capturedArtifactKeys.has(String(label).replace(/\s+/g, "")));
-  if (missedArtifactLabels.length > 0) {
-    await log(`Marking missed artifact signals as unconfirmed: ${missedArtifactLabels.join(", ")}`);
-    for (const label of missedArtifactLabels) {
-      artifacts.push({ displayName: label, unconfirmed: true, error: "Response-local artifact signal was present, but no downloadable artifact was captured." });
-    }
-    await flushArtifactsState(artifacts);
+  if (suspiciousLabels.length > 0) {
+    await log(`Ignoring plain-text artifact-like labels without downloadable controls: ${suspiciousLabels.join(", ")}`);
   }
 
   return artifacts;
@@ -2045,14 +2420,14 @@ async function run() {
     await setComposerText(currentJob, await readFile(currentJob.promptPath, "utf8"));
     const baselineAssistantCount = (await assistantMessages(currentJob)).length;
     await log(`Assistant response count before send: ${baselineAssistantCount}`);
-    await clickSend(currentJob);
-    await log(`Waiting ${POST_SEND_SETTLE_MS}ms after send to avoid streaming interruption`);
+    await clickSend(currentJob, baselineAssistantCount);
+    await log(`Send accepted; waiting ${POST_SEND_SETTLE_MS}ms after send to avoid streaming interruption`);
     await sleep(POST_SEND_SETTLE_MS);
 
     const observedChatUrl = isGrokJob(currentJob)
-      ? stripQuery(await currentUrl(currentJob))
+      ? stripUrlQueryAndHash(await currentUrl(currentJob))
       : await waitForStableChatUrl(currentJob, currentJob.chatUrl);
-    const observedConversationId = parseConversationId(observedChatUrl) || currentJob.conversationId;
+    const observedConversationId = conversationIdFromUrl(observedChatUrl) || currentJob.conversationId;
     const awaitingResponsePatch = {
       heartbeatAt: new Date().toISOString(),
       ...(observedConversationId ? { chatUrl: observedChatUrl, conversationId: observedConversationId } : {}),
@@ -2067,7 +2442,7 @@ async function run() {
     const completion = await waitForChatCompletion(currentJob, baselineAssistantCount);
     if (isGrokJob(currentJob) && !currentJob.conversationId) {
       const stableGrokChatUrl = await waitForStableChatUrl(currentJob, undefined);
-      const stableGrokConversationId = parseConversationId(stableGrokChatUrl);
+      const stableGrokConversationId = conversationIdFromUrl(stableGrokChatUrl);
       if (!stableGrokConversationId) {
         throw new Error(`Grok response completed but the conversation URL did not stabilize; current URL: ${stableGrokChatUrl || "(unknown)"}`);
       }
@@ -2084,14 +2459,15 @@ async function run() {
       message: "Extracting the completed response body.",
       patch: { heartbeatAt: new Date().toISOString() },
     }));
-    await secureWriteText(currentJob.responsePath, `${completion.responseText.trim()}\n`);
+    const responseText = isGrokJob(currentJob) ? completion.responseText.trim() : stripChatGptResponseChrome(completion.responseText);
+    await secureWriteText(currentJob.responsePath, `${responseText}\n`);
     currentJob = await mutateJob((job) => transitionOracleJobPhase(job, "downloading_artifacts", {
       at: new Date().toISOString(),
       source: "oracle:worker",
       message: "Downloading any response artifacts.",
       patch: { heartbeatAt: new Date().toISOString() },
     }));
-    const artifacts = await downloadArtifacts(currentJob, completion.responseIndex, completion.responseText);
+    const artifacts = await downloadArtifacts(currentJob, completion.responseIndex, responseText);
     const artifactFailureCount = artifacts.filter((artifact) => artifact.unconfirmed || artifact.error).length;
     const finalPhase = artifactFailureCount > 0 ? "complete_with_artifact_errors" : "complete";
 

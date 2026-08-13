@@ -6,31 +6,64 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { constants as fsConstants, existsSync, realpathSync, readFileSync } from "node:fs";
-import { access, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { access, cp as copyDirectory, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { delimiter, dirname, join } from "node:path";
+import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
+import { assertNotKnownBrowserUserDataPath, sweetCookieSafeStoragePasswordScrubbedEnv } from "../shared/browser-profile-helpers.mjs";
 import { jobBlocksAdmission } from "../shared/job-coordination-helpers.mjs";
 import { isTrackedProcessAlive } from "../shared/process-helpers.mjs";
-import type { OracleConfig } from "./config.js";
+import type { OracleConfig, OracleProvider } from "./config.js";
+import { getOracleJobsDir } from "../shared/state-path-helpers.mjs";
+import { resolveOracleProviderArchivePlan } from "./provider-capabilities.js";
 import { createLease, listLeaseMetadata, readLeaseMetadata, releaseLease, withAuthLock } from "./locks.js";
 
 const SEED_GENERATION_FILE = ".oracle-seed-generation";
-const DEFAULT_ORACLE_JOBS_DIR = "/tmp";
-const ORACLE_JOBS_DIR = process.env.PI_ORACLE_JOBS_DIR?.trim() || DEFAULT_ORACLE_JOBS_DIR;
 const AGENT_BROWSER_BIN = [process.env.AGENT_BROWSER_PATH, "/opt/homebrew/bin/agent-browser", "/usr/local/bin/agent-browser"].find(
   (candidate) => typeof candidate === "string" && candidate && existsSync(candidate),
 ) || "agent-browser";
 const PROFILE_CLONE_TIMEOUT_MS = 120_000;
 const ORACLE_SUBPROCESS_KILL_GRACE_MS = 2_000;
+
+function killProcessTree(child: ReturnType<typeof spawn>): void {
+  if (process.platform === "win32" && child.pid) {
+    spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore", windowsHide: true })
+      .on("error", () => undefined);
+    return;
+  }
+  child.kill("SIGTERM");
+}
+
+function killProcess(child: ReturnType<typeof spawn>): void {
+  if (process.platform === "win32" && child.pid) {
+    spawn("taskkill", ["/pid", String(child.pid), "/f"], { stdio: "ignore", windowsHide: true })
+      .on("error", () => undefined);
+    return;
+  }
+  child.kill("SIGKILL");
+}
 const WORKSPACE_ROOT_MARKERS = [
-  ".pi/extensions/oracle.json",
-  ".pi",
+  join(CONFIG_DIR_NAME, "extensions", "oracle.json"),
+  CONFIG_DIR_NAME,
   "AGENTS.md",
 ] as const;
-const REQUIRED_ORACLE_DEPENDENCIES = [
-  { name: "agent-browser", command: AGENT_BROWSER_BIN },
-  { name: "tar", command: "tar" },
-  { name: "zstd", command: "zstd" },
-] as const;
+function cpCommand(): string {
+  return process.env.PI_ORACLE_CP_PATH?.trim() || "cp";
+}
+
+function requiredOracleDependencies(config: OracleConfig, provider = config.defaults.provider): Array<{ name: string; command: string }> {
+  const archivePlan = resolveOracleProviderArchivePlan(provider);
+  const dependencies = [
+    { name: "agent-browser", command: AGENT_BROWSER_BIN },
+    { name: "tar", command: "tar" },
+  ];
+  if (archivePlan.requiresZstd) {
+    dependencies.push({ name: "zstd", command: "zstd" });
+  }
+  if (config.browser.cloneStrategy === "apfs-clone" && process.platform === "darwin") {
+    dependencies.push({ name: "cp", command: cpCommand() });
+  }
+  return dependencies;
+}
 
 export interface OracleRuntimeLeaseMetadata {
   jobId: string;
@@ -140,6 +173,10 @@ function unreadableAuthSeedProfileMessage(seedDir: string): string {
   return `Oracle auth seed profile is not readable: ${seedDir}. Fix its permissions or rerun /oracle-auth.`;
 }
 
+function unauthenticatedAuthSeedProfileMessage(seedDir: string): string {
+  return `Oracle auth seed profile exists but is not authenticated: ${seedDir}. Run /oracle-auth to create a verified auth seed before submitting oracle jobs.`;
+}
+
 function missingBrowserExecutableMessage(executablePath: string): string {
   return `Configured oracle browser executable does not exist: ${executablePath}. Fix browser.executablePath or install Chrome there.`;
 }
@@ -152,30 +189,61 @@ function missingLocalDependencyMessage(name: string): string {
   return `Oracle prerequisite not found on PATH: ${name}. Install ${name} and retry.`;
 }
 
+function unsafeOracleProfilePathMessage(label: string, path: string, error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return `Oracle ${label} path is unsafe: ${path}. ${message}`;
+}
+
+function assertSafeOracleProfilePath(
+  path: string,
+  label: "auth seed profile" | "runtime profile" | "runtime profiles",
+  config?: OracleConfig,
+): void {
+  try {
+    assertNotKnownBrowserUserDataPath(path, `Oracle ${label}`, {
+      cookieSources: config ? { chromeProfile: config.auth.chromeProfile, chromeCookiePath: config.auth.chromeCookiePath } : undefined,
+    });
+  } catch (error) {
+    throw new Error(unsafeOracleProfilePathMessage(label, path, error));
+  }
+}
+
 function unwritableOracleDirectoryMessage(label: "runtime profiles" | "jobs", path: string): string {
   return `Oracle ${label} directory is not writable: ${path}. Fix its permissions or configure a writable path, then retry.`;
 }
 
+async function isExecutableFile(path: string): Promise<boolean> {
+  try {
+    const stats = await stat(path);
+    if (!stats.isFile()) return false;
+    await access(path, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function executableNameCandidates(command: string): string[] {
+  if (process.platform !== "win32" || /\.[^\\/]+$/.test(command)) return [command];
+  const extensions = (process.env.PATHEXT || ".COM;.EXE;.BAT;.CMD;.PS1").split(";").filter(Boolean);
+  return [command, ...extensions.map((extension) => `${command}${extension.toLowerCase()}`), ...extensions.map((extension) => `${command}${extension.toUpperCase()}`)];
+}
+
 async function resolveExecutableOnPath(command: string): Promise<string | undefined> {
   if (!command) return undefined;
-  if (command.includes("/")) {
-    try {
-      await access(command, fsConstants.X_OK);
-      return command;
-    } catch {
-      return undefined;
+  if (command.includes("/") || command.includes("\\")) {
+    for (const candidate of executableNameCandidates(command)) {
+      if (await isExecutableFile(candidate)) return candidate;
     }
+    return undefined;
   }
 
   const pathValue = process.env.PATH ?? "";
   for (const segment of pathValue.split(delimiter)) {
     if (!segment) continue;
-    const candidate = join(segment, command);
-    try {
-      await access(candidate, fsConstants.X_OK);
-      return candidate;
-    } catch {
-      continue;
+    for (const name of executableNameCandidates(command)) {
+      const candidate = join(segment, name);
+      if (await isExecutableFile(candidate)) return candidate;
     }
   }
   return undefined;
@@ -235,6 +303,7 @@ async function assertWritableDirectory(path: string, label: "runtime profiles" |
 
 export async function assertOracleAuthSeedProfileReady(config: OracleConfig): Promise<void> {
   const seedDir = config.browser.authSeedProfileDir;
+  assertSafeOracleProfilePath(seedDir, "auth seed profile", config);
   let seedStats;
   try {
     seedStats = await stat(seedDir);
@@ -254,16 +323,21 @@ export async function assertOracleAuthSeedProfileReady(config: OracleConfig): Pr
   } catch {
     throw new Error(unreadableAuthSeedProfileMessage(seedDir));
   }
+
+  if (!getSeedGeneration(config)) {
+    throw new Error(unauthenticatedAuthSeedProfileMessage(seedDir));
+  }
 }
 
-export async function assertOracleSubmitPrerequisites(config: OracleConfig): Promise<void> {
+export async function assertOracleSubmitPrerequisites(config: OracleConfig, provider: OracleProvider = config.defaults.provider): Promise<void> {
+  assertSafeOracleProfilePath(config.browser.runtimeProfilesDir, "runtime profiles", config);
   await assertOracleAuthSeedProfileReady(config);
   await assertConfiguredBrowserExecutableReady(config.browser.executablePath);
-  for (const dependency of REQUIRED_ORACLE_DEPENDENCIES) {
+  for (const dependency of requiredOracleDependencies(config, provider)) {
     await assertRequiredLocalDependencyReady(dependency.name, dependency.command);
   }
   await assertWritableDirectory(config.browser.runtimeProfilesDir, "runtime profiles");
-  await assertWritableDirectory(ORACLE_JOBS_DIR, "jobs");
+  await assertWritableDirectory(getOracleJobsDir(), "jobs");
 }
 
 export function getSeedGeneration(config: OracleConfig): string | undefined {
@@ -284,7 +358,7 @@ export async function writeSeedGeneration(config: OracleConfig, value = new Date
 }
 
 function activeJobExists(jobId: string): boolean {
-  const path = join(ORACLE_JOBS_DIR, `oracle-${jobId}`, "job.json");
+  const path = join(getOracleJobsDir(), `oracle-${jobId}`, "job.json");
   if (!existsSync(path)) return false;
   try {
     const job = JSON.parse(readFileSync(path, "utf8")) as {
@@ -379,7 +453,7 @@ export async function releaseConversationLease(conversationId: string | undefine
 }
 
 function profileCloneArgs(config: OracleConfig, sourceDir: string, destinationDir: string): string[] {
-  if (config.browser.cloneStrategy === "apfs-clone") {
+  if (config.browser.cloneStrategy === "apfs-clone" && process.platform === "darwin") {
     return ["-cR", sourceDir, destinationDir];
   }
   return ["-R", sourceDir, destinationDir];
@@ -387,7 +461,7 @@ function profileCloneArgs(config: OracleConfig, sourceDir: string, destinationDi
 
 async function spawnCp(args: string[], options?: { timeoutMs?: number }): Promise<void> {
   await new Promise<void>((resolve, reject) => {
-    const child = spawn("cp", args, { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(cpCommand(), args, { env: sweetCookieSafeStoragePasswordScrubbedEnv(), stdio: ["ignore", "pipe", "pipe"], shell: process.platform === "win32" });
     let stderr = "";
     let timedOut = false;
     let killTimer: NodeJS.Timeout | undefined;
@@ -401,9 +475,9 @@ async function spawnCp(args: string[], options?: { timeoutMs?: number }): Promis
     if ((options?.timeoutMs ?? 0) > 0) {
       killTimer = setTimeout(() => {
         timedOut = true;
-        child.kill("SIGTERM");
+        killProcessTree(child);
         killGraceTimer = setTimeout(() => {
-          child.kill("SIGKILL");
+          killProcess(child);
         }, ORACLE_SUBPROCESS_KILL_GRACE_MS);
         killGraceTimer.unref?.();
       }, options?.timeoutMs);
@@ -445,11 +519,16 @@ export async function cloneSeedProfileToRuntime(
 ): Promise<string | undefined> {
   const seedDir = config.browser.authSeedProfileDir;
   await assertOracleAuthSeedProfileReady(config);
+  assertSafeOracleProfilePath(runtimeProfileDir, "runtime profile", config);
 
   await withAuthLock({ runtimeProfileDir, seedDir }, async () => {
     await rm(runtimeProfileDir, { recursive: true, force: true }).catch(() => undefined);
     await mkdir(dirname(runtimeProfileDir), { recursive: true, mode: 0o700 }).catch(() => undefined);
-    await spawnCp(profileCloneArgs(config, seedDir, runtimeProfileDir), { timeoutMs: options?.cpTimeoutMs ?? PROFILE_CLONE_TIMEOUT_MS });
+    if (config.browser.cloneStrategy === "apfs-clone" && process.platform === "darwin") {
+      await spawnCp(profileCloneArgs(config, seedDir, runtimeProfileDir), { timeoutMs: options?.cpTimeoutMs ?? PROFILE_CLONE_TIMEOUT_MS });
+    } else {
+      await copyDirectory(seedDir, runtimeProfileDir, { recursive: true, force: true, verbatimSymlinks: true });
+    }
     await removeChromiumProcessSingletonArtifacts(runtimeProfileDir);
   });
 
@@ -465,7 +544,7 @@ export interface OracleCleanupReport {
 
 async function closeRuntimeBrowserSession(runtimeSessionName: string): Promise<string | undefined> {
   return new Promise<string | undefined>((resolve) => {
-    const child = spawn(AGENT_BROWSER_BIN, ["--session", runtimeSessionName, "close"], { stdio: "ignore" });
+    const child = spawn(AGENT_BROWSER_BIN, ["--session", runtimeSessionName, "close"], { env: sweetCookieSafeStoragePasswordScrubbedEnv(), stdio: "ignore", shell: process.platform === "win32" });
     let settled = false;
     let timeout: NodeJS.Timeout | undefined;
     let timedOut = false;
@@ -479,15 +558,21 @@ async function closeRuntimeBrowserSession(runtimeSessionName: string): Promise<s
 
     timeout = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGTERM");
+      killProcessTree(child);
       setTimeout(() => {
-        child.kill("SIGKILL");
+        killProcess(child);
         finish(`Timed out closing agent-browser session ${runtimeSessionName} after ${AGENT_BROWSER_CLOSE_TIMEOUT_MS}ms`);
       }, 2_000).unref?.();
     }, AGENT_BROWSER_CLOSE_TIMEOUT_MS);
     timeout.unref?.();
 
-    child.on("error", (error) => finish(`Failed to close agent-browser session ${runtimeSessionName}: ${error.message}`));
+    child.on("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") {
+        finish();
+        return;
+      }
+      finish(`Failed to close agent-browser session ${runtimeSessionName}: ${error.message}`);
+    });
     child.on("close", (code) => {
       if (timedOut || code === 0) finish();
       else finish(`agent-browser close exited with code ${code} for session ${runtimeSessionName}`);
@@ -510,9 +595,12 @@ export async function cleanupRuntimeArtifacts(runtime: {
   }
   if (runtime.runtimeProfileDir) {
     report.attempted.push("runtimeProfileDir");
-    await rm(runtime.runtimeProfileDir, { recursive: true, force: true }).catch((error: Error) => {
-      report.warnings.push(`Failed to remove runtime profile ${runtime.runtimeProfileDir}: ${error.message}`);
-    });
+    try {
+      assertSafeOracleProfilePath(runtime.runtimeProfileDir, "runtime profile");
+      await rm(runtime.runtimeProfileDir, { recursive: true, force: true });
+    } catch (error) {
+      report.warnings.push(`Failed to remove runtime profile ${runtime.runtimeProfileDir}: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
   if (runtime.conversationId) {
     report.attempted.push("conversationLease");
@@ -529,4 +617,3 @@ export async function cleanupRuntimeArtifacts(runtime: {
 
   return report;
 }
-
